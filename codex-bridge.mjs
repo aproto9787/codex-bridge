@@ -2,7 +2,7 @@
 // codex-bridge.mjs — Codex CLI를 Claude Code 네이티브 팀원으로 동작시키는 래퍼
 // zero-dependency (Node.js 내장 모듈만 사용)
 
-import { readFile, writeFile, mkdir, rmdir, stat as fsStat } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rmdir, rename, stat as fsStat } from "node:fs/promises";
 import { existsSync, createWriteStream } from "node:fs";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -11,7 +11,7 @@ import { homedir } from "node:os";
 // ─── Constants ───
 const POLL_INTERVAL_MS = 500;
 const SHUTDOWN_POLL_MS = 3000;
-const MAX_RESULT_BYTES = 0; // 무제한
+const MAX_RESULT_BYTES = 5 * 1024 * 1024; // 5MB
 const TEAMS_BASE = join(homedir(), ".claude", "teams");
 const TASKS_BASE = join(homedir(), ".claude", "tasks");
 const LEADER_NAME = "team-lead";
@@ -473,7 +473,7 @@ function spawnTuiViewer(agentName) {
   // Try real Codex TUI binary first (patched with --pipe-fd support)
   let tuiBin = findTuiBin();
 
-  if (existsSync(tuiBin)) {
+  if (tuiBin && existsSync(tuiBin)) {
     const realVersion = getCodexVersion();
     log("TUI", `spawning real codex-tui: ${tuiBin} (codex version: ${realVersion || "unknown"})`);
     const tuiEnv = { ...process.env, FORCE_COLOR: "1" };
@@ -542,20 +542,28 @@ async function readInbox(inboxPath) {
   try {
     const raw = await readFile(inboxPath, "utf-8");
     return JSON.parse(raw);
-  } catch {
+  } catch (err) {
+    if (err.code === "ENOENT") return [];
+    const backupPath = `${inboxPath}.corrupt.${Date.now()}`;
+    try {
+      await rename(inboxPath, backupPath);
+      log("INBOX-CORRUPT", `quarantined to ${backupPath}: ${err.message}`);
+    } catch {}
     return [];
   }
 }
 
 async function readUnreadMessages(inboxPath) {
-  const messages = await readInbox(inboxPath);
-  const unread = [];
-  for (let i = 0; i < messages.length; i++) {
-    if (!messages[i].read) {
-      unread.push({ index: i, msg: messages[i] });
+  return withLock(inboxPath, async () => {
+    const messages = await readInbox(inboxPath);
+    const unread = [];
+    for (let i = 0; i < messages.length; i++) {
+      if (!messages[i].read) {
+        unread.push({ index: i, msg: messages[i] });
+      }
     }
-  }
-  return unread;
+    return unread;
+  });
 }
 
 async function markAsRead(inboxPath, indices) {
@@ -723,7 +731,7 @@ async function markMyTasksCompleted(config) {
       try {
         const raw = await readFile(fp, "utf-8");
         const task = JSON.parse(raw);
-        if (task.owner === config.agentName && task.status !== "completed") {
+        if (task.owner === config.agentName && task.status === "in_progress") {
           task.status = "completed";
           await writeFile(fp, JSON.stringify(task, null, 2), "utf-8");
           log("TASK-DONE", `marked task ${task.id || f} as completed`);
@@ -872,8 +880,23 @@ class AppServerSession {
 
   sendRequest(method, params = {}) {
     const id = this.nextId++;
+    const RPC_TIMEOUT_MS = 30000;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`RPC timeout (${RPC_TIMEOUT_MS}ms) for ${method}`));
+      }, RPC_TIMEOUT_MS);
+      this.pending.set(id, {
+        resolve: (val) => {
+          clearTimeout(timer);
+          resolve(val);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+        method,
+      });
       try {
         this.sendRaw({
           jsonrpc: "2.0",
@@ -882,6 +905,7 @@ class AppServerSession {
           params,
         });
       } catch (err) {
+        clearTimeout(timer);
         this.pending.delete(id);
         reject(err);
       }
@@ -1018,7 +1042,7 @@ class AppServerSession {
 
       this.currentTurn = null;
       const output = truncateOutput(current.chunks.join(""));
-      if (turn.status === "completed") {
+      if (turn.status === "completed" || turn.status === "interrupted") {
         current.resolve({
           success: true,
           output: output || "(no output)",
@@ -1050,6 +1074,7 @@ class AppServerSession {
   handleClose(code, signal) {
     currentChild = null;
     this.child = null;
+    this.stdoutBuffer = "";
     const reason = signal
       ? `Codex app-server exited via signal ${signal}`
       : `Codex app-server exited with code ${code}`;
@@ -1206,12 +1231,9 @@ async function pollLoop(config) {
       const unread = await readUnreadMessages(myInbox);
 
       if (unread.length > 0) {
-        await markAsRead(
-          myInbox,
-          unread.map((u) => u.index)
-        );
+        const processedIndices = [];
 
-        for (const { msg } of unread) {
+        for (const { index, msg } of unread) {
           if (!running) break;
 
           const protocol = tryParseProtocol(msg.text);
@@ -1230,6 +1252,8 @@ async function pollLoop(config) {
                 await sleep(2000);
               }
             }
+            processedIndices.push(index);
+            await markAsRead(myInbox, processedIndices);
             await handleShutdown(config, protocol);
             return;
           }
@@ -1237,14 +1261,17 @@ async function pollLoop(config) {
           // 프로토콜 메시지 스킵
           if (protocol?.type === "permission_request") {
             log("SKIP", "permission_request (Codex uses own sandbox)");
+            processedIndices.push(index);
             continue;
           }
           if (protocol?.type === "mode_set_request") {
             log("SKIP", `mode_set_request: ${protocol.mode}`);
+            processedIndices.push(index);
             continue;
           }
           if (protocol?.type === "idle_notification") {
             log("SKIP", "idle_notification from leader");
+            processedIndices.push(index);
             continue;
           }
 
@@ -1282,6 +1309,12 @@ async function pollLoop(config) {
               handleTurnError(err);
             }
           }
+
+          processedIndices.push(index);
+        }
+
+        if (processedIndices.length > 0) {
+          await markAsRead(myInbox, processedIndices);
         }
       }
 
@@ -1299,9 +1332,13 @@ async function pollLoop(config) {
 }
 
 // ─── Signal Handlers ───
+let shuttingDown = false;
+
 function setupSignalHandlers(config) {
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
     process.on(sig, async () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
       log("SIGNAL", sig);
       running = false;
       if (currentChild) {

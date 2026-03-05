@@ -7,6 +7,7 @@ const require = createRequire(import.meta.url);
 const blessed = require("blessed");
 
 const RENDER_DEBOUNCE_MS = 50;
+const MAX_CONTENT_LINES = 3000;
 const DEFAULT_WORKER_NAME = "codex-worker";
 
 function parseArgs(argv) {
@@ -79,6 +80,7 @@ const state = {
 };
 
 const commandStateById = new Map();
+const itemsWithOutputDelta = new Set();
 
 function escapeTags(value) {
   return String(value ?? "").replace(/\{/g, "\\{").replace(/\}/g, "\\}");
@@ -133,6 +135,10 @@ function flushRender() {
   if (state.pendingChunks.length > 0) {
     state.contentText += state.pendingChunks.join("");
     state.pendingChunks.length = 0;
+    const lines = state.contentText.split("\n");
+    if (lines.length > MAX_CONTENT_LINES) {
+      state.contentText = lines.slice(lines.length - MAX_CONTENT_LINES).join("\n");
+    }
     content.setContent(state.contentText);
     content.setScrollPerc(100);
   }
@@ -208,6 +214,7 @@ function handleNotification(method, params = {}) {
 
     case "item/commandExecution/outputDelta": {
       const itemId = resolveItemId(params);
+      if (itemId) itemsWithOutputDelta.add(itemId);
       if (state.mode !== "exec" || state.lastItemId !== itemId) {
         endStreamMode();
         state.lastItemId = itemId;
@@ -282,13 +289,17 @@ function handleNotification(method, params = {}) {
         appendContent(
           `${escapeTags(command)} in ${escapeTags(cwd)} ${statusWord}${durationText}:\n`,
         );
-        if (item.aggregatedOutput) {
+        if (item.aggregatedOutput && !(itemId && itemsWithOutputDelta.has(itemId))) {
           const out = String(item.aggregatedOutput);
           appendContent(escapeTags(out));
           if (!out.endsWith("\n")) appendContent("\n");
         }
-        if (itemId) commandStateById.delete(itemId);
-        else state.lastCommandState = null;
+        if (itemId) {
+          commandStateById.delete(itemId);
+          itemsWithOutputDelta.delete(itemId);
+        } else {
+          state.lastCommandState = null;
+        }
       } else if (item.type === "agentMessage") {
         endStreamMode();
       } else if (item.type === "fileChange") {
@@ -344,6 +355,8 @@ function handleNotification(method, params = {}) {
 
     case "turn/completed": {
       endStreamMode();
+      commandStateById.clear();
+      itemsWithOutputDelta.clear();
       const turn = params.turn || {};
       const turnStatus = turn.status || "completed";
       if (state.tokens > 0) {
