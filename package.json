@@ -1,0 +1,12 @@
+{
+  "name": "codex-bridge",
+  "version": "0.1.0",
+  "description": "Bridge to run Codex CLI as a Claude Code native teammate",
+  "type": "module",
+  "bin": {
+    "codex-bridge": "./codex-bridge.mjs"
+  },
+  "dependencies": {
+    "blessed": "^0.1.81"
+  }
+}
