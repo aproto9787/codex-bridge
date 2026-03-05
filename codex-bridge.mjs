@@ -10,6 +10,8 @@ import { homedir } from "node:os";
 
 // ─── Constants ───
 const POLL_INTERVAL_MS = 500;
+const POLL_IDLE_MS = 2000;
+const POLL_ACTIVE_MS = 100;
 const SHUTDOWN_POLL_MS = 3000;
 const MAX_RESULT_BYTES = 5 * 1024 * 1024; // 5MB
 const TEAMS_BASE = join(homedir(), ".claude", "teams");
@@ -22,6 +24,8 @@ let viewerProc = null;
 let logStream = null;
 // Real session info from app-server (populated after thread/start)
 let sessionInfo = null;
+let lastInboxMtime = 0;
+let currentPollMs = POLL_INTERVAL_MS;
 
 // ─── Inline mkdir-based Lock (proper-lockfile compatible) ───
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -572,7 +576,15 @@ async function markAsRead(inboxPath, indices) {
     for (const idx of indices) {
       if (messages[idx]) messages[idx].read = true;
     }
-    await writeFile(inboxPath, JSON.stringify(messages, null, 2), "utf-8");
+    const readMessages = messages.filter((m) => m.read);
+    let pruned = messages;
+    if (readMessages.length > 100) {
+      const unread = messages.filter((m) => !m.read);
+      const recentRead = readMessages.slice(-50);
+      pruned = [...recentRead, ...unread];
+      log("INBOX-PRUNE", `pruned ${messages.length} → ${pruned.length} messages`);
+    }
+    await writeFile(inboxPath, JSON.stringify(pruned, null, 2), "utf-8");
   });
 }
 
@@ -640,6 +652,20 @@ async function sendToLeader(config, text, summary) {
   const msg = makeMessage(config.agentName, text, config.agentColor, summary);
   await writeToInbox(leaderInbox, msg);
   log("SENT", summary || text.slice(0, 60));
+}
+
+async function sendToLeaderWithRetry(config, text, summary) {
+  try {
+    await sendToLeader(config, text, summary);
+  } catch (err1) {
+    log("SEND-RETRY", `first attempt failed: ${err1.message}, retrying...`);
+    try {
+      await sleep(500);
+      await sendToLeader(config, text, summary);
+    } catch (err2) {
+      log("SEND-FAIL", `result delivery failed permanently: ${err2.message}`);
+    }
+  }
 }
 
 let lastIdleSentAt = 0;
@@ -815,36 +841,47 @@ class AppServerSession {
     child.on("close", (code, signal) => this.handleClose(code, signal));
     child.on("error", (err) => this.handleFatal(err));
 
-    const initResult = await this.sendRequest("initialize", {
-      clientInfo: { name: "codex-bridge", version: "0.1.0" },
-    });
-    this.sendNotification("initialized", {});
+    try {
+      const initResult = await this.sendRequest("initialize", {
+        clientInfo: { name: "codex-bridge", version: "0.1.0" },
+      });
+      this.sendNotification("initialized", {});
 
-    const threadStartParams = {
-      approvalPolicy: "never",
-      sandbox: "danger-full-access",
-      cwd: this.cwd,
-      // model은 Codex 자체 설정 사용 (Claude 모델명 전달 방지)
-    };
+      const threadStartParams = {
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+        cwd: this.cwd,
+        // model은 Codex 자체 설정 사용 (Claude 모델명 전달 방지)
+      };
 
-    const started = await this.sendRequest("thread/start", threadStartParams);
-    this.threadId = started?.thread?.id || null;
-    if (!this.threadId) {
-      throw new Error("thread/start returned no thread id");
+      const started = await this.sendRequest("thread/start", threadStartParams);
+      this.threadId = started?.thread?.id || null;
+      if (!this.threadId) {
+        throw new Error("thread/start returned no thread id");
+      }
+
+      // Store REAL session info from app-server responses
+      sessionInfo = {
+        userAgent: initResult?.userAgent || initResult?.user_agent || "",
+        model: started?.model || "",
+        modelProvider: started?.modelProvider || started?.model_provider || "",
+        serviceTier: started?.serviceTier || started?.service_tier || null,
+        approvalPolicy: started?.approvalPolicy || started?.approval_policy || "never",
+        sandbox: started?.sandbox || { type: "danger-full-access" },
+        cwd: started?.cwd || this.cwd,
+        reasoningEffort: started?.reasoningEffort || started?.reasoning_effort || null,
+      };
+      log("SESSION", `real info: model=${sessionInfo.model} provider=${sessionInfo.modelProvider} ua=${sessionInfo.userAgent}`);
+    } catch (err) {
+      if (this.child === child) {
+        log("STARTUP-FAIL", `cleaning up child (pid=${child.pid}): ${err.message}`);
+        child.kill("SIGTERM");
+        this.child = null;
+        currentChild = null;
+        this.threadId = null;
+      }
+      throw err;
     }
-
-    // Store REAL session info from app-server responses
-    sessionInfo = {
-      userAgent: initResult?.userAgent || initResult?.user_agent || "",
-      model: started?.model || "",
-      modelProvider: started?.modelProvider || started?.model_provider || "",
-      serviceTier: started?.serviceTier || started?.service_tier || null,
-      approvalPolicy: started?.approvalPolicy || started?.approval_policy || "never",
-      sandbox: started?.sandbox || { type: "danger-full-access" },
-      cwd: started?.cwd || this.cwd,
-      reasoningEffort: started?.reasoningEffort || started?.reasoning_effort || null,
-    };
-    log("SESSION", `real info: model=${sessionInfo.model} provider=${sessionInfo.modelProvider} ua=${sessionInfo.userAgent}`);
   }
 
   sendRaw(message) {
@@ -914,11 +951,12 @@ class AppServerSession {
 
   handleStdout(chunk) {
     this.stdoutBuffer += String(chunk);
+    let start = 0;
     while (true) {
-      const idx = this.stdoutBuffer.indexOf("\n");
+      const idx = this.stdoutBuffer.indexOf("\n", start);
       if (idx < 0) break;
-      const line = this.stdoutBuffer.slice(0, idx).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(idx + 1);
+      const line = this.stdoutBuffer.slice(start, idx).trim();
+      start = idx + 1;
       if (!line) continue;
 
       let msg;
@@ -930,6 +968,9 @@ class AppServerSession {
       }
 
       this.handleRpcMessage(msg);
+    }
+    if (start > 0) {
+      this.stdoutBuffer = this.stdoutBuffer.slice(start);
     }
   }
 
@@ -1110,7 +1151,7 @@ class AppServerSession {
         expectedTurnId: activeTurnId,
         input: [{ type: "text", text: `[STEER — 리더로부터 실시간 메시지]\n${prompt}` }],
       });
-      return this.currentTurn.completion;
+      return;
     }
 
     const turnState = {
@@ -1179,6 +1220,8 @@ class AppServerSession {
 async function pollLoop(config) {
   const myInbox = getInboxPath(config.agentName, config.teamName);
   await ensureInbox(myInbox);
+  lastInboxMtime = 0;
+  currentPollMs = POLL_INTERVAL_MS;
   const session = new AppServerSession({
     cwd: process.cwd(),
     effort: codexEffort,
@@ -1195,9 +1238,10 @@ async function pollLoop(config) {
   // 턴 완료 핸들러: 결과를 리더에게 전송
   function handleTurnResult(result) {
     activeTurnPromise = null;
+    steerChain = Promise.resolve();
     if (!running) return;
     if (result.success) {
-      sendToLeader(config, result.output, "Codex task completed").catch(() => {});
+      void sendToLeaderWithRetry(config, result.output, "Codex task completed");
       markMyTasksCompleted(config).catch(() => {});
       sendIdleNotification(config, {
         summary: "Task completed, ready for next",
@@ -1205,7 +1249,7 @@ async function pollLoop(config) {
       }).catch(() => {});
     } else {
       const errMsg = `[ERROR] Codex failed:\n${result.output}`;
-      sendToLeader(config, errMsg, "Codex task failed").catch(() => {});
+      void sendToLeaderWithRetry(config, errMsg, "Codex task failed");
       sendIdleNotification(config, {
         idleReason: "error",
         summary: "Task failed",
@@ -1216,9 +1260,10 @@ async function pollLoop(config) {
 
   function handleTurnError(err) {
     activeTurnPromise = null;
+    steerChain = Promise.resolve();
     if (!running) return;
     const errMsg = `[ERROR] Codex app-server error: ${err.message}`;
-    sendToLeader(config, errMsg, "Codex task failed").catch(() => {});
+    void sendToLeaderWithRetry(config, errMsg, "Codex task failed");
     sendIdleNotification(config, {
       idleReason: "error",
       summary: "Task failed",
@@ -1228,98 +1273,118 @@ async function pollLoop(config) {
 
   try {
     while (running) {
-      const unread = await readUnreadMessages(myInbox);
+      const st = await fsStat(myInbox).catch(() => null);
+      let sawMessages = false;
+      if (st && st.mtimeMs !== lastInboxMtime) {
+        lastInboxMtime = st.mtimeMs;
+        const unread = await readUnreadMessages(myInbox);
 
-      if (unread.length > 0) {
-        const processedIndices = [];
+        if (unread.length > 0) {
+          sawMessages = true;
+          currentPollMs = POLL_ACTIVE_MS;
+          const processedIndices = [];
 
-        for (const { index, msg } of unread) {
-          if (!running) break;
+          for (const { index, msg } of unread) {
+            if (!running) break;
 
-          const protocol = tryParseProtocol(msg.text);
+            const protocol = tryParseProtocol(msg.text);
 
-          // shutdown_request 처리: 활성 턴 완료 대기 후 승인
-          if (protocol?.type === "shutdown_request") {
+            // shutdown_request 처리: 활성 턴 완료 대기 후 승인
+            if (protocol?.type === "shutdown_request") {
+              if (activeTurnPromise) {
+                log("SHUTDOWN", "waiting for active turn to complete (max 15s)...");
+                const race = await Promise.race([
+                  activeTurnPromise.then(() => "done"),
+                  sleep(15000).then(() => "timeout"),
+                ]).catch(() => "error");
+                if (race === "timeout") {
+                  log("SHUTDOWN", "timeout — interrupting active turn");
+                  await session.interruptActiveTurn().catch(() => {});
+                  await sleep(2000);
+                }
+              }
+              processedIndices.push(index);
+              await markAsRead(myInbox, processedIndices);
+              await handleShutdown(config, protocol);
+              return;
+            }
+
+            // 프로토콜 메시지 스킵
+            if (protocol?.type === "permission_request") {
+              log("SKIP", "permission_request (Codex uses own sandbox)");
+              processedIndices.push(index);
+              continue;
+            }
+            if (protocol?.type === "mode_set_request") {
+              log("SKIP", `mode_set_request: ${protocol.mode}`);
+              processedIndices.push(index);
+              continue;
+            }
+            if (protocol?.type === "idle_notification") {
+              log("SKIP", "idle_notification from leader");
+              processedIndices.push(index);
+              continue;
+            }
+
+            const taskText = msg.text;
+
+            // ★ Phase 2 핵심: 활성 턴이 있으면 steer, 없으면 새 턴
             if (activeTurnPromise) {
-              log("SHUTDOWN", "waiting for active turn to complete (max 15s)...");
-              const race = await Promise.race([
-                activeTurnPromise.then(() => "done"),
-                sleep(15000).then(() => "timeout"),
-              ]).catch(() => "error");
-              if (race === "timeout") {
-                log("SHUTDOWN", "timeout — interrupting active turn");
-                await session.interruptActiveTurn().catch(() => {});
-                await sleep(2000);
-              }
-            }
-            processedIndices.push(index);
-            await markAsRead(myInbox, processedIndices);
-            await handleShutdown(config, protocol);
-            return;
-          }
-
-          // 프로토콜 메시지 스킵
-          if (protocol?.type === "permission_request") {
-            log("SKIP", "permission_request (Codex uses own sandbox)");
-            processedIndices.push(index);
-            continue;
-          }
-          if (protocol?.type === "mode_set_request") {
-            log("SKIP", `mode_set_request: ${protocol.mode}`);
-            processedIndices.push(index);
-            continue;
-          }
-          if (protocol?.type === "idle_notification") {
-            log("SKIP", "idle_notification from leader");
-            processedIndices.push(index);
-            continue;
-          }
-
-          const taskText = msg.text;
-
-          // ★ Phase 2 핵심: 활성 턴이 있으면 steer, 없으면 새 턴
-          if (session.currentTurn) {
-            // 양방향: 실행 중인 Codex에 실시간 메시지 주입
-            log("STEER", `injecting mid-turn message, len=${taskText.length}`);
-            // steer는 직렬화: 이전 steer 완료 후 다음 steer 전송
-            steerChain = steerChain.then(async () => {
-              try {
-                await session.runTurn(taskText);
-              } catch (steerErr) {
-                log("STEER-ERR", steerErr.message);
-                // steer 실패 시 pendingSteerQueue에 보관 → 다음 턴에서 처리
+              if (session.currentTurn) {
+                // 양방향: 실행 중인 Codex에 실시간 메시지 주입
+                log("STEER", `injecting mid-turn message, len=${taskText.length}`);
+                // steer는 직렬화: 이전 steer 완료 후 다음 steer 전송
+                steerChain = steerChain.then(async () => {
+                  if (!session.currentTurn) {
+                    pendingSteerQueue.push(taskText);
+                    log("STEER-DEFERRED", `turn ended, queued for next turn (${pendingSteerQueue.length} pending)`);
+                    return;
+                  }
+                  try {
+                    await session.runTurn(taskText);
+                  } catch (steerErr) {
+                    log("STEER-ERR", steerErr.message);
+                    // steer 실패 시 pendingSteerQueue에 보관 → 다음 턴에서 처리
+                    pendingSteerQueue.push(taskText);
+                    log("STEER-QUEUED", `queued for next turn (${pendingSteerQueue.length} pending)`);
+                  }
+                }).catch(() => {});
+              } else {
+                log("STEER-STARTING", `turn starting, queuing message (len=${taskText.length})`);
                 pendingSteerQueue.push(taskText);
-                log("STEER-QUEUED", `queued for next turn (${pendingSteerQueue.length} pending)`);
               }
-            }).catch(() => {});
-          } else {
-            // 유휴 상태: 새 턴 시작 (비동기 — 블로킹하지 않음!)
-            // pendingSteerQueue에 실패한 steer가 있으면 본문에 포함
-            let fullPrompt = taskText;
-            if (pendingSteerQueue.length > 0) {
-              const queued = pendingSteerQueue.splice(0);
-              log("STEER-DRAIN", `draining ${queued.length} queued steer messages into new turn`);
-              fullPrompt = [taskText, ...queued].join("\n\n---\n\n");
+            } else {
+              // 유휴 상태: 새 턴 시작 (비동기 — 블로킹하지 않음!)
+              // pendingSteerQueue에 실패한 steer가 있으면 본문에 포함
+              let fullPrompt = taskText;
+              if (pendingSteerQueue.length > 0) {
+                const queued = pendingSteerQueue.splice(0);
+                log("STEER-DRAIN", `draining ${queued.length} queued steer messages into new turn`);
+                fullPrompt = [taskText, ...queued].join("\n\n---\n\n");
+              }
+              log("TASK", `from=${msg.from}, len=${fullPrompt.length}`);
+              try {
+                activeTurnPromise = session.runTurn(fullPrompt);
+                activeTurnPromise.then(handleTurnResult, handleTurnError);
+              } catch (err) {
+                handleTurnError(err);
+              }
             }
-            log("TASK", `from=${msg.from}, len=${fullPrompt.length}`);
-            try {
-              activeTurnPromise = session.runTurn(fullPrompt);
-              activeTurnPromise.then(handleTurnResult, handleTurnError);
-            } catch (err) {
-              handleTurnError(err);
-            }
+
+            processedIndices.push(index);
           }
 
-          processedIndices.push(index);
-        }
-
-        if (processedIndices.length > 0) {
-          await markAsRead(myInbox, processedIndices);
+          if (processedIndices.length > 0) {
+            await markAsRead(myInbox, processedIndices);
+          }
         }
       }
 
       if (running) {
-        await sleep(POLL_INTERVAL_MS);
+        if (!sawMessages) {
+          currentPollMs = Math.min(currentPollMs * 2, POLL_IDLE_MS);
+        }
+        await sleep(currentPollMs);
       }
     }
   } finally {
