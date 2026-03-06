@@ -796,6 +796,7 @@ class AppServerSession {
     this.child = null;
     this.threadId = null;
     this.activeTurnId = null;
+    this.acceptTurnStarted = false;
     this.currentTurn = null;
     this.pending = new Map();
     this.nextId = 1;
@@ -1027,6 +1028,10 @@ class AppServerSession {
     renderNotification(method, params);
 
     if (method === "turn/started") {
+      if (!this.currentTurn || !this.acceptTurnStarted) {
+        log("TURN-LATE", `ignoring late turn/started (acceptTurnStarted=${this.acceptTurnStarted})`);
+        return;
+      }
       const turnId = params.turn?.id;
       if (turnId) {
         this.activeTurnId = turnId;
@@ -1034,6 +1039,7 @@ class AppServerSession {
           this.currentTurn.turnId = turnId;
         }
       }
+      this.acceptTurnStarted = false;
       return;
     }
 
@@ -1081,6 +1087,7 @@ class AppServerSession {
         current.turnId = completedTurnId;
       }
 
+      this.acceptTurnStarted = false;
       this.currentTurn = null;
       const output = truncateOutput(current.chunks.join(""));
       if (turn.status === "completed" || turn.status === "interrupted") {
@@ -1108,14 +1115,17 @@ class AppServerSession {
       this.currentTurn.reject(error);
       this.currentTurn = null;
     }
+    this.acceptTurnStarted = false;
     this.threadId = null;
     this.activeTurnId = null;
+    if (viewerProc) viewerProc._sessionSent = false;
   }
 
   handleClose(code, signal) {
     currentChild = null;
     this.child = null;
     this.stdoutBuffer = "";
+    if (viewerProc) viewerProc._sessionSent = false;
     const reason = signal
       ? `Codex app-server exited via signal ${signal}`
       : `Codex app-server exited with code ${code}`;
@@ -1130,6 +1140,7 @@ class AppServerSession {
       this.currentTurn.reject(error);
       this.currentTurn = null;
     }
+    this.acceptTurnStarted = false;
     this.threadId = null;
     this.activeTurnId = null;
   }
@@ -1169,6 +1180,7 @@ class AppServerSession {
     this.currentTurn = turnState;
 
     try {
+      this.acceptTurnStarted = true;
       const started = await this.sendRequest("turn/start", {
         threadId: this.threadId,
         effort: this.effort,
@@ -1181,7 +1193,11 @@ class AppServerSession {
           turnState.turnId = turnId;
         }
       }
+      // acceptTurnStarted is consumed by the turn/started notification handler.
+      // Keep it true here until turn/started arrives or the turn is otherwise cleaned up.
     } catch (err) {
+      this.acceptTurnStarted = false;
+      this.activeTurnId = null;
       if (this.currentTurn === turnState) {
         this.currentTurn = null;
       }
@@ -1234,12 +1250,34 @@ async function pollLoop(config) {
   // steer 직렬화 체인 + 실패 시 보관 큐
   let steerChain = Promise.resolve();
   let pendingSteerQueue = [];
+  const MAX_PENDING_STEERS = 32;
+  function enqueuePendingSteer(text) {
+    if (pendingSteerQueue.length >= MAX_PENDING_STEERS) {
+      const dropped = pendingSteerQueue.shift();
+      log("STEER-DROP", `queue full (${MAX_PENDING_STEERS}), dropped oldest (len=${dropped.length})`);
+    }
+    pendingSteerQueue.push(text);
+  }
 
   // 턴 완료 핸들러: 결과를 리더에게 전송
   function handleTurnResult(result) {
     activeTurnPromise = null;
     steerChain = Promise.resolve();
     if (!running) return;
+
+    if (pendingSteerQueue.length > 0) {
+      const queued = pendingSteerQueue.splice(0);
+      const fullPrompt = queued.join("\n\n---\n\n");
+      log("STEER-AUTODRAIN", `draining ${queued.length} queued messages into new turn`);
+      try {
+        activeTurnPromise = session.runTurn(fullPrompt);
+        activeTurnPromise.then(handleTurnResult, handleTurnError);
+      } catch (err) {
+        handleTurnError(err);
+      }
+      return;
+    }
+
     if (result.success) {
       void sendToLeaderWithRetry(config, result.output, "Codex task completed");
       markMyTasksCompleted(config).catch(() => {});
@@ -1262,6 +1300,20 @@ async function pollLoop(config) {
     activeTurnPromise = null;
     steerChain = Promise.resolve();
     if (!running) return;
+
+    if (pendingSteerQueue.length > 0) {
+      const queued = pendingSteerQueue.splice(0);
+      const fullPrompt = queued.join("\n\n---\n\n");
+      log("STEER-AUTODRAIN", `draining ${queued.length} queued messages after error`);
+      try {
+        activeTurnPromise = session.runTurn(fullPrompt);
+        activeTurnPromise.then(handleTurnResult, handleTurnError);
+      } catch (e) {
+        handleTurnError(e);
+      }
+      return;
+    }
+
     const errMsg = `[ERROR] Codex app-server error: ${err.message}`;
     void sendToLeaderWithRetry(config, errMsg, "Codex task failed");
     sendIdleNotification(config, {
@@ -1336,7 +1388,7 @@ async function pollLoop(config) {
                 // steer는 직렬화: 이전 steer 완료 후 다음 steer 전송
                 steerChain = steerChain.then(async () => {
                   if (!session.currentTurn) {
-                    pendingSteerQueue.push(taskText);
+                    enqueuePendingSteer(taskText);
                     log("STEER-DEFERRED", `turn ended, queued for next turn (${pendingSteerQueue.length} pending)`);
                     return;
                   }
@@ -1345,13 +1397,13 @@ async function pollLoop(config) {
                   } catch (steerErr) {
                     log("STEER-ERR", steerErr.message);
                     // steer 실패 시 pendingSteerQueue에 보관 → 다음 턴에서 처리
-                    pendingSteerQueue.push(taskText);
+                    enqueuePendingSteer(taskText);
                     log("STEER-QUEUED", `queued for next turn (${pendingSteerQueue.length} pending)`);
                   }
                 }).catch(() => {});
               } else {
                 log("STEER-STARTING", `turn starting, queuing message (len=${taskText.length})`);
-                pendingSteerQueue.push(taskText);
+                enqueuePendingSteer(taskText);
               }
             } else {
               // 유휴 상태: 새 턴 시작 (비동기 — 블로킹하지 않음!)
@@ -1447,11 +1499,26 @@ function passthroughToClaude() {
     env: { ...process.env, CLAUDE_CODE_TEAMMATE_COMMAND: "" }, // bridge 재귀 방지
   });
 
+  const forwardSignal = (sig) => {
+    if (!child.killed) {
+      child.kill(sig);
+    }
+  };
+  const cleanupSignalHandlers = () => {
+    process.removeListener("SIGTERM", forwardSignal);
+    process.removeListener("SIGINT", forwardSignal);
+  };
+
+  process.on("SIGTERM", forwardSignal);
+  process.on("SIGINT", forwardSignal);
+
   child.on("close", (code) => {
+    cleanupSignalHandlers();
     killMyPane();
     process.exit(code ?? 0);
   });
   child.on("error", (err) => {
+    cleanupSignalHandlers();
     console.error("[codex-bridge] Claude passthrough error:", err);
     killMyPane();
     process.exit(1);
