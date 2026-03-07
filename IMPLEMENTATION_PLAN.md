@@ -485,107 +485,140 @@ event-logger.mjs ← captain-control.mjs (이벤트 기록)
 
 ### Phase 3로 이월된 항목
 
-- `bin/codex-worker.mjs` (독립 worker 프로세스)
-- Captain↔Worker UDS transport (uds-bus-server/client, ndjson-codec)
+- UDS control plane (제어 채널만, worker 프로세스 분리는 Phase 4)
 - Daemon supervisor + PID file
-- SQLite persistence + recovery-manager
+- SQLite persistence + recovery
+- Claude reviewer (opt-in)
+- Budget policy
 
 ---
 
-## Phase 3: 확장 — UDS + SQLite + Daemon + Claude Reviewer
+## Phase 3: Durable Background Captain (v2 재설계)
 
-> 목표: 독립 worker 프로세스, UDS transport, persistence, daemon 모드, LLM planner, Claude review, budget
+> 목표: "background attachable durable captain" — 단일 프로세스 유지, UDS 제어 채널, SQLite 영속, 경량 daemon
+> 스코프 축소: ~2,180 LOC → ~1,100-1,300 LOC. Worker multiprocess + LLM planner는 Phase 4로 이월.
 
-### 추가 모듈
+### Wave 3A: Background Control (~450-550 LOC)
 
 | File | LOC | Purpose |
 |---|---|---|
-| `lib/transport/uds-bus-server.mjs` | ~180 | Unix domain socket 서버 (Phase 2에서 이월) |
-| `lib/transport/uds-bus-client.mjs` | ~140 | Unix domain socket 클라이언트 |
-| `lib/transport/ndjson-codec.mjs` | ~80 | NDJSON encode/decode |
-| `bin/codex-worker.mjs` | ~120 | 독립 worker 프로세스 엔트리 (Phase 2에서 이월) |
-| `lib/storage/session-store-sqlite.mjs` | ~340 | SQLite CRUD |
-| `lib/storage/migrations/001_init.sql` | ~60 | 4테이블 스키마 (workers, tasks, runs, kv) |
-| `lib/runtime/daemon-supervisor.mjs` | ~260 | Daemonize, PID file, attach/stop |
-| `lib/runtime/recovery-manager.mjs` | ~220 | DB ↔ live worker 상태 조정 |
-| `lib/review/claude-reviewer.mjs` | ~220 | `claude -p` one-shot review |
-| `lib/policy/budget-policy.mjs` | ~180 | Token/cost 제한 |
-| `lib/runtime/llm-planner.mjs` | ~300 | Codex 기반 작업 분해/배정 |
-| `bin/codex-team.mjs` 확장 | +80 | status/stop 서브커맨드 |
-| **Total** | **~2,180** | |
+| `lib/transport/ndjson-codec.mjs` | ~60 | NDJSON line encode/decode (Duplex transform) |
+| `lib/transport/uds-control-server.mjs` | ~150 | UDS 서버 — 제어 채널 only (snapshot/dispatch/steer/interrupt) |
+| `lib/transport/uds-control-client.mjs` | ~100 | UDS 클라이언트 — attach용 |
+| `lib/runtime/daemon-supervisor.mjs` | ~180 | fork + PID file + 수명관리 (start/stop/status) |
+| `bin/codex-team.mjs` 확장 | +60 | start --background, attach, status, stop 서브커맨드 |
 
-### SQLite 스키마 (4 테이블)
+**핵심 결정:**
+- UDS는 제어 채널 전용 (TUI→Captain 명령 + Captain→TUI 이벤트)
+- Worker는 여전히 단일 프로세스 내 in-proc (Phase 4에서 분리)
+- Daemon은 `child_process.fork()` + unref — 복잡한 daemonize 라이브러리 불필요
+- PID file: `~/.codex/teams/{name}/captain.pid`
+- attach: UDS 연결 → 이벤트 스트림 수신 + 명령 전송
+
+### Wave 3B: Durable State (~350-450 LOC)
+
+| File | LOC | Purpose |
+|---|---|---|
+| `lib/storage/session-store.mjs` | ~250 | better-sqlite3 CRUD (workers, tasks, runs, kv) |
+| `lib/storage/migrations/001_init.sql` | ~50 | 4테이블 스키마 |
+| `lib/runtime/recovery-manager.mjs` | ~120 | Captain 시작 시 DB ↔ live state 조정 |
+
+**SQLite 스키마 (4 테이블):**
 
 ```sql
 CREATE TABLE workers (
-  id TEXT PRIMARY KEY, name TEXT, status TEXT DEFAULT 'pending',
-  pid INTEGER, session_info TEXT, registered_at TEXT, last_heartbeat_at TEXT
+  id TEXT PRIMARY KEY, status TEXT DEFAULT 'pending',
+  generation INTEGER DEFAULT 0, session_info TEXT,
+  total_tokens INTEGER DEFAULT 0, cost_usd REAL DEFAULT 0,
+  registered_at TEXT, last_heartbeat_at TEXT
 );
 CREATE TABLE tasks (
-  id TEXT PRIMARY KEY, prompt TEXT, status TEXT DEFAULT 'pending',
-  owner_worker_id TEXT, result TEXT, created_at TEXT, completed_at TEXT
+  id INTEGER PRIMARY KEY AUTOINCREMENT, prompt TEXT NOT NULL,
+  status TEXT DEFAULT 'pending', owner_worker_id TEXT,
+  result TEXT, created_at TEXT DEFAULT (datetime('now')), completed_at TEXT
 );
 CREATE TABLE runs (
-  id TEXT PRIMARY KEY, task_id TEXT REFERENCES tasks(id),
-  worker_id TEXT REFERENCES workers(id), turn_id TEXT,
-  status TEXT DEFAULT 'running', token_usage TEXT, cost_usd REAL,
-  started_at TEXT, completed_at TEXT
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER REFERENCES tasks(id),
+  worker_id TEXT REFERENCES workers(id),
+  turn_id TEXT, status TEXT DEFAULT 'running',
+  token_usage TEXT, cost_usd REAL,
+  started_at TEXT DEFAULT (datetime('now')), completed_at TEXT
 );
 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
 ```
 
-### Claude Reviewer
+**핵심 결정:**
+- better-sqlite3 (동기, WAL 모드) — async wrapper 불필요
+- recovery-manager: 시작 시 DB의 'running' 상태를 'interrupted'로 리셋, 실제 worker 상태와 동기화
+- event-logger.mjs의 NDJSON은 유지 (SQLite와 병행, 디버깅용)
 
+### Wave 3C: Guardrails + Review (~220-320 LOC)
+
+| File | LOC | Purpose |
+|---|---|---|
+| `lib/policy/budget-policy.mjs` | ~100 | Token/cost 상한 체크 (DB 기반 누적 조회) |
+| `lib/review/claude-reviewer.mjs` | ~150 | `claude -p` one-shot review (opt-in) |
+
+**Claude Reviewer:**
 ```
 실행 조건:
   - run 완료 + 실제 변경 있음 + budget 허용 + claude 바이너리 존재
+  - opt-in: config.review = true 또는 --review 플래그
 호출:
   claude -p --output-format stream-json (env -u CLAUDECODE)
 입력:
-  목표 + 변경 파일 목록 + diff 요약 + 워커 결과 + 알려진 리스크
+  목표 + 변경 파일 목록 + diff 요약 + 워커 결과
 출력:
   ReviewResult { findings[], severity, approved }
 비용:
-  기본 1회만. blocking finding + 실제 수정 시 1회 재호출 허용
+  기본 1회만. blocking finding 시 1회 재호출 허용
 ```
 
-### LLM Planner (Captain 지능화)
+**Budget Policy:**
+- DB의 runs 테이블에서 누적 토큰/비용 조회
+- config에서 maxTokens / maxCostUsd 설정
+- 초과 시 dispatch 차단 + 이벤트 emit
 
-Phase 1의 단일 작업 모드를 Codex 기반 동적 분해로 확장:
-- 사용자 프롬프트 → Codex가 서브태스크 분해
-- 서브태스크별 워커 배정
-- 워커 결과 기반 재계획 (blocked/failed 시)
-- deterministic 코드 + LLM 하이브리드 (큐/상태/재시도는 코드, 분해/판단은 LLM)
+### Phase 4로 이월 (확장)
+
+| 항목 | 이유 |
+|---|---|
+| Worker multiprocess (UDS data plane) | 현재 in-proc으로 충분, 메모리 격리 필요 시 도입 |
+| LLM Planner (Codex 기반 분해/배정) | Captain 안정화 후 점진 도입 |
+| Advanced TUI (독립 프로세스 TUI) | UDS attach로 기본 기능 충분 |
 
 ### 완료 기준
 
-- [ ] `codex-team start` → daemon + auto-attach
-- [ ] `codex-team attach/status/stop` 동작
+- [ ] `codex-team start --background` → daemon 시작 + PID file
+- [ ] `codex-team attach` → UDS 연결, 이벤트 스트림 + 명령 전송
+- [ ] `codex-team status/stop` 동작
 - [ ] Captain 재시작 시 SQLite에서 상태 복원
-- [ ] 완료된 run에 Claude review 자동 실행 (조건 충족 시)
-- [ ] Budget 초과 시 신규 작업/리뷰 차단
+- [ ] Budget 초과 시 dispatch 차단
+- [ ] `--review` 플래그로 Claude review 실행 (opt-in)
 
 ---
 
 ## Phase 간 관계
 
 ```
-Phase 1 (MVP)                Phase 2 (운영)              Phase 3 (확장)
-──────────────               ──────────────              ──────────────
-단일 프로세스                  단일 프로세스 유지            멀티 프로세스 (UDS)
-in-memory EventEmitter       + Captain 제어 API           + SQLite 영속
-terminal-kit TUI (in-proc)   + TUI lifecycle 분리         + daemon 모드
-단일 작업 모드               + Captain 큐 시스템           + LLM planner
-수동 shutdown                + crash recovery             + Claude reviewer
-                             + config + 구조화 로그        + budget policy
-~3,230 LOC                   +990 LOC ≈ 4,220            +2,180 LOC ≈ 6,400
+Phase 1 (MVP)                Phase 2 (운영)              Phase 3 (Durable)           Phase 4 (확장)
+──────────────               ──────────────              ──────────────              ──────────────
+단일 프로세스                  단일 프로세스 유지            단일 프로세스 + daemon        멀티 프로세스 (UDS)
+in-memory EventEmitter       + Captain 제어 API           + UDS 제어 채널              + UDS 데이터 채널
+terminal-kit TUI (in-proc)   + TUI lifecycle 분리         + attachable TUI             + 독립 TUI 프로세스
+단일 작업 모드               + Captain 큐 시스템           + SQLite 영속                + LLM planner
+수동 shutdown                + crash recovery             + budget + review            + 고급 비용 관리
+                             + config + 구조화 로그
+~3,230 LOC                   +990 LOC ≈ 4,220            +1,100~1,300 LOC ≈ 5,500     TBD
 ```
 
 ### 각 Phase 독립성 보장
 
 - **Phase 1 완료 후**: 독립 실행 가능한 제품. `codex-team start "prompt"` 동작
 - **Phase 2 완료 후**: 운영 가능한 Captain. crash recovery, 큐, TUI detach, 설정 파일
-- **Phase 3 완료 후**: 완전한 네이티브급. UDS 멀티프로세스, 지능형 배정, 리뷰, 비용 관리
+- **Phase 3 완료 후**: Durable background captain. daemon, UDS attach, SQLite 영속, opt-in 리뷰
+- **Phase 4 완료 후**: 네이티브급 확장. 멀티프로세스, LLM planner
 
 ### codex-bridge.mjs와의 관계
 
@@ -593,6 +626,7 @@ terminal-kit TUI (in-proc)   + TUI lifecycle 분리         + daemon 모드
 Phase 1: bridge 동결, 새 제품은 bin/codex-team.mjs에서 독립 시작
 Phase 2: bridge에서 app-server-client.mjs를 import할 수 있음 (공유 시작)
 Phase 3: bridge가 captain-runtime을 내부적으로 사용할 수 있음 (통합 옵션)
+Phase 4: 완전 통합 가능 (captain이 bridge 역할 흡수)
          단, bridge의 Claude 호환 entry contract는 영구 보존
 ```
 
@@ -603,39 +637,39 @@ Phase 3: bridge가 captain-runtime을 내부적으로 사용할 수 있음 (통�
 ```
 codex-bridge/                       (= codex-team-v2 worktree)
   bin/
-    codex-team.mjs                   # 새 CLI 엔트리 (~180 LOC)
-    codex-worker.mjs                 # 독립 worker 프로세스 (Phase 2, ~120 LOC)
-    codex-tui.mjs                    # 독립 TUI attach (Phase 2, ~80 LOC)
+    codex-team.mjs                   # CLI 엔트리 (~240 LOC, Phase 3 확장)
+    codex-tui.mjs                    # 독립 TUI attach placeholder (~6 LOC)
   lib/
     core/
       types.mjs                      # 공유 타입 (~80 LOC)
-      logger.mjs                     # 구조화 로거 (~50 LOC)
-      config.mjs                     # 팀 설정 (Phase 2, ~100 LOC)
+      logger.mjs                     # 구조화 로거 (~65 LOC)
+      config.mjs                     # 팀 설정 (~120 LOC)
+      event-logger.mjs               # NDJSON 이벤트 로거 (~70 LOC)
     codex/
-      app-server-client.mjs          # Codex app-server 클라이언트 (~350 LOC)
-      notification-parser.mjs        # Stateless pure parser: method/params → NormalizedEvent[] (~200 LOC)
-      turn-accumulator.mjs           # Stateful 상태 머신: NormalizedEvent → TurnResult (~120 LOC)
+      app-server-client.mjs          # Codex app-server 클라이언트 (~440 LOC)
+      notification-parser.mjs        # Stateless pure parser (~450 LOC)
+      turn-accumulator.mjs           # Stateful 상태 머신 (~150 LOC)
     runtime/
-      captain-runtime.mjs            # Supervisor (~300 LOC)
-      worker-host.mjs                # Worker 래퍼 (~350 LOC)
-      daemon-supervisor.mjs          # Phase 3 (~260 LOC)
-      recovery-manager.mjs           # Phase 3 (~220 LOC)
-      llm-planner.mjs                # Phase 3 (~300 LOC)
+      captain-runtime.mjs            # Supervisor (~235 LOC)
+      captain-control.mjs            # Captain 제어 API (~165 LOC)
+      worker-host.mjs                # Worker 래퍼 (~450 LOC)
+      daemon-supervisor.mjs          # Phase 3 (~180 LOC)
+      recovery-manager.mjs           # Phase 3 (~120 LOC)
     transport/
-      uds-bus-server.mjs             # Phase 2 (~180 LOC)
-      uds-bus-client.mjs             # Phase 2 (~140 LOC)
-      ndjson-codec.mjs               # Phase 2 (~80 LOC)
+      ndjson-codec.mjs               # Phase 3 (~60 LOC)
+      uds-control-server.mjs         # Phase 3 (~150 LOC)
+      uds-control-client.mjs         # Phase 3 (~100 LOC)
     storage/
-      session-store-sqlite.mjs       # Phase 3 (~340 LOC)
-      migrations/001_init.sql        # Phase 3 (~60 LOC)
+      session-store.mjs              # Phase 3 (~250 LOC)
+      migrations/001_init.sql        # Phase 3 (~50 LOC)
     ui/
       tk-screen.mjs                  # terminal-kit 메인 (~500 LOC)
-      worker-panel.mjs               # Worker 패널 + ring buffer (~250 LOC)
-      captain-panel.mjs              # Captain 상태 패널 (~150 LOC)
+      worker-panel.mjs               # Worker 패널 + ring buffer (~320 LOC)
+      captain-panel.mjs              # Captain 상태 패널 (~145 LOC)
     review/
-      claude-reviewer.mjs            # Phase 3 (~220 LOC)
+      claude-reviewer.mjs            # Phase 3 (~150 LOC)
     policy/
-      budget-policy.mjs              # Phase 3 (~180 LOC)
+      budget-policy.mjs              # Phase 3 (~100 LOC)
   test/
     helpers/
       fake-app-server.mjs            # Stub (~200 LOC)
@@ -643,6 +677,8 @@ codex-bridge/                       (= codex-team-v2 worktree)
     turn-accumulator.test.mjs
     worker-host.test.mjs
     captain-runtime.test.mjs
+    captain-control.test.mjs
+    config.test.mjs
   codex-bridge.mjs                   # 동결 — Claude 호환 adapter
   codex-tui-viewer.mjs               # 동결 — CODEX_UI=legacy fallback
   package.json
@@ -660,7 +696,8 @@ codex-bridge/                       (= codex-team-v2 worktree)
 | 병렬 worker 메모리 | 2→4 점진적 증가, free -h 모니터링 |
 | Stage 경계 붕괴 | 3 phase로 축소, 각 phase 내부에서만 결합 허용 |
 | 과도한 추상화 | "공유 해석기 + 소비자" 패턴, 5계층 파이프라인 금지 |
-| LLM planner 불확실성 | Phase 1은 단일 작업 모드, Phase 3에서 LLM planner 점진 도입 |
+| LLM planner 불확실성 | Phase 3에서 제외, Phase 4에서 Captain 안정화 후 도입 |
+| better-sqlite3 네이티브 빌드 | WSL2에서 사전 테스트, fallback으로 NDJSON event-logger 유지 |
 
 ---
 
