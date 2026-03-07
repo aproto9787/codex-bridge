@@ -470,6 +470,15 @@ function findTuiBin() {
     const p = (result.stdout || "").trim();
     if (p && existsSync(p)) return p;
   } catch {}
+  // 3. Known build paths
+  const knownPaths = [
+    join(homedir(), "argoss", "_external", "openai-codex", "codex-rs", "target", "release", "codex-tui"),
+    join(homedir(), ".local", "bin", "codex-tui"),
+    "/usr/local/bin/codex-tui",
+  ];
+  for (const p of knownPaths) {
+    if (existsSync(p)) return p;
+  }
   return null;
 }
 
