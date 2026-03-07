@@ -3,6 +3,9 @@
 > 2026-03-07 | 2차 토론(plan-critic, strategy-advisor, pragmatist) 반영
 > v1 대비 변경: 7단계→3단계, 40+파일→~10 핵심 모듈, in-memory first
 > 재평가(source-verifier, consistency-checker, feasibility-reviewer) 반영: 매핑 보완, LOC 상향, 시간 현실화
+>
+> **Phase 1 완료** (c92d64f 구현 + 264951d 핫픽스, 22 테스트 통과)
+> 검증 결과 및 미수정 백로그: `/root/codex-team-v2/CHANGELOG.md` 참조
 
 ---
 
@@ -343,71 +346,164 @@ Phase 1에서는 **fan-out 하지 않음**:
 
 ---
 
-## Phase 2: 완성 — UDS Transport + 설정 + 안정화
+## Phase 2: 완성 — 운영 가능한 Captain + 안정화
 
-> 목표: detachable TUI, 외부 worker, 설정 파일, 에러 복구
+> 목표: Captain 제어 API, 큐 시스템, crash recovery, TUI lifecycle 분리, 설정 파일
+> 설계 토론 결과: full UDS (captain↔worker 소켓)는 Phase 3로 이월. Worker는 in-process 유지.
+> 핵심 가치: "TUI 닫아도 팀이 안 죽고, worker 죽으면 자동 복구"
 
-### 추가 모듈
+### 모듈 (신규 + 변경)
 
-| File | LOC | Purpose |
-|---|---|---|
-| `lib/transport/uds-bus-server.mjs` | ~180 | Unix domain socket 서버 |
-| `lib/transport/uds-bus-client.mjs` | ~140 | Unix domain socket 클라이언트 |
-| `lib/transport/ndjson-codec.mjs` | ~80 | NDJSON encode/decode |
-| `lib/core/config.mjs` | ~100 | 팀 설정 파일 (~/.codex/teams/<team>/config.json) |
-| `bin/codex-worker.mjs` | ~120 | 독립 worker 프로세스 엔트리 |
-| `bin/codex-tui.mjs` | ~80 | 독립 TUI attach 엔트리 |
-| **Total** | **~700** | |
+| # | File | Type | LOC | Purpose |
+|---|---|---|---|---|
+| 1 | `lib/runtime/captain-control.mjs` | **신규** | ~200 | Captain 공용 제어 API: dispatch/steer/interrupt/snapshot + 큐 관리 |
+| 2 | `lib/core/config.mjs` | **신규** | ~120 | 팀 설정 파일 로드 (CLI > env > config > defaults) |
+| 3 | `lib/core/event-logger.mjs` | **신규** | ~100 | Event NDJSON 로거 (canonical envelope, Phase 3 SQLite 입력 호환) |
+| 4 | `bin/codex-tui.mjs` | **신규** | ~80 | 독립 TUI attach 엔트리 (같은 프로세스 내 captain에 연결) |
+| 5 | `lib/runtime/captain-runtime.mjs` | 변경 | +100 | worker crash recovery (backoff 재시작, generation ID), lifecycle 정리 (M8) |
+| 6 | `lib/runtime/worker-host.mjs` | 변경 | +60 | generation ID, restart 지원, 에러→재시작 전이 |
+| 7 | `lib/ui/tk-screen.mjs` | 변경 | +80 | `_workers` 직접 접근 제거 → CaptainControl 인터페이스 의존, 큐 UI |
+| 8 | `lib/ui/captain-panel.mjs` | 변경 | +40 | 큐 영역 표시 (M1 해소) |
+| 9 | `bin/codex-team.mjs` | 변경 | +60 | `q` = TUI만 종료 / `Q` = 팀 전체 종료, `attach` 서브커맨드 |
+|   | `test/*.test.mjs` | 변경 | +150 | crash recovery, queue, control API 테스트 |
+|   | **Total** | | **~990** | |
 
-### 변경 사항
+### Captain 공용 제어 API (captain-control.mjs)
 
-- CaptainRuntime: in-memory EventEmitter → UDS 서버로 전환
-- WorkerHost: in-process → 독립 프로세스 (`bin/codex-worker.mjs`)로 전환 가능
-- TUI: in-process render → UDS 클라이언트로 detach 가능
-- 설정 파일: `~/.codex/teams/<team>/config.json` (worker 수, effort, model 등)
+```js
+export class CaptainControl {
+  constructor(captainRuntime)
 
-### UDS 프로토콜 (NDJSON)
+  // 작업 배정 — idle이면 즉시 시작, busy면 큐에 적재
+  dispatch(workerId, prompt)    → { queued: boolean, position?: number }
+
+  // 스티어 — active turn에 주입, idle이면 에러
+  steer(workerId, prompt)       → void
+
+  // 인터럽트
+  interrupt(workerId)           → Promise<boolean>
+
+  // 전체 스냅샷 (attach 시 초기 동기화용)
+  snapshot()                    → { workers: Map<string, WorkerState>, queue: QueueEntry[] }
+
+  // 이벤트 구독 (TUI/로거 등)
+  on('workerEvent' | 'workerStateChange' | 'queueChange', handler)
+}
+```
+
+TkScreen은 CaptainControl만 의존. captainRuntime._workers 직접 접근 제거.
+
+### Captain 큐 시스템
 
 ```
-Captain → Worker:
-  {"v":1,"type":"cmd.start_turn","workerId":"w1","prompt":"..."}
-  {"v":1,"type":"cmd.steer","workerId":"w1","prompt":"..."}
-  {"v":1,"type":"cmd.shutdown","workerId":"w1"}
+사용자 → TUI 'a' 키 → dispatch(workerId, prompt)
+  ├─ worker idle → 즉시 assignTask()
+  └─ worker busy → 큐에 적재 → worker idle 시 자동 dequeue
 
-Worker → Captain:
-  {"v":1,"type":"worker.ready","workerId":"w1","sessionInfo":{...}}
-  {"v":1,"type":"worker.event","workerId":"w1","event":{NormalizedEvent}}
-  {"v":1,"type":"worker.turn_result","workerId":"w1","result":{...}}
-
-Captain → TUI:
-  (모든 worker 이벤트 + captain 상태를 브로드캐스트)
+큐 표시: captain-panel에 큐 영역 추가
+  task 1: w0 ▶ "fix auth bug"
+  task 2: w1 ⏳ "add tests"
 ```
 
-### 안정화 항목
+### Worker Crash Recovery
 
-- [ ] Worker crash → captain이 감지, 재시작 (backoff: 1s, 2s, 4s, max 30s)
-- [ ] Stale socket 정리 (captain start 시)
-- [ ] Signal handling: SIGTERM → drain active turns (timeout 10s) → cleanup
-- [ ] 구조화 로그 → `~/.codex/teams/<team>/logs/`
-- [ ] Event NDJSON log → `~/.codex/teams/<team>/runtime/events.ndjson`
+```
+worker 'error' 또는 'close' 감지
+  → generation ID 증가
+  → backoff 재시작 (1s, 2s, 4s, 8s, max 30s)
+  → 3연속 실패 시 'dead' 상태 → TUI에 표시, 수동 재시작 대기
+  → 재시작 성공 시 backoff 리셋
+  → 큐에 남은 작업 자동 재배정
+```
+
+### TUI Lifecycle 분리
+
+```
+현재: q/Ctrl+C → screen.shutdown() → runtime.shutdown() → 프로세스 종료
+변경:
+  q     → TUI만 종료 (captain 계속 실행, background)
+  Q     → 팀 전체 종료 (drain + cleanup)
+  codex-team attach <team> → 실행 중인 captain에 TUI 재연결
+```
+
+구현: captain을 별도 프로세스로 분리하지 않고, 같은 프로세스에서 TUI detach/reattach.
+TUI 없이도 captain이 worker들을 관리하고 큐를 처리.
+
+### Config 파일
+
+```json
+// ~/.codex/teams/<team>/config.json
+{
+  "workerCount": 2,
+  "effort": "high",
+  "model": null,
+  "sandbox": "danger-full-access",
+  "approvalPolicy": "never",
+  "logDir": "~/.codex/teams/<team>/logs",
+  "maxRestartAttempts": 3,
+  "restartBackoffMs": [1000, 2000, 4000, 8000, 30000]
+}
+```
+
+우선순위: CLI flag > 환경변수 > config 파일 > 기본값
+
+### 구조화 로그 + Event NDJSON
+
+```
+~/.codex/teams/<team>/
+  logs/
+    captain.log          # 구조화 JSON 라인 로그
+  runtime/
+    events.ndjson        # canonical event envelope (Phase 3 SQLite 입력 호환)
+```
+
+Event envelope 포맷:
+```json
+{"v":1,"ts":"...","workerId":"w0","gen":1,"kind":"agent_delta","data":{...}}
+```
+
+`gen` (generation) 필드로 crash 전/후 이벤트 구분.
+
+### 의존 관계
+
+```
+captain-control.mjs ← tk-screen.mjs (제어 API만 의존)
+captain-control.mjs → captain-runtime.mjs (내부 위임)
+captain-runtime.mjs → worker-host.mjs (crash recovery 확장)
+config.mjs ← captain-runtime.mjs, bin/codex-team.mjs
+event-logger.mjs ← captain-control.mjs (이벤트 기록)
+```
 
 ### 완료 기준
 
-- [ ] `codex-team start` → captain 시작 + TUI auto-attach
-- [ ] `codex-tui attach <team>` → 실행 중인 팀에 TUI 연결
-- [ ] worker crash 후 자동 재시작
-- [ ] 설정 파일로 worker 수/effort 조정
+- [ ] `codex-team start "prompt"` → captain + TUI, `q`로 TUI만 종료
+- [ ] `codex-team attach` → 실행 중인 captain에 TUI 재연결
+- [ ] worker crash 시 자동 재시작 (backoff)
+- [ ] busy worker에 dispatch → 큐 적재 → idle 시 자동 실행
+- [ ] 설정 파일로 worker 수/effort/model 조정
+- [ ] events.ndjson에 모든 이벤트 기록
+
+### Phase 3로 이월된 항목
+
+- `bin/codex-worker.mjs` (독립 worker 프로세스)
+- Captain↔Worker UDS transport (uds-bus-server/client, ndjson-codec)
+- Daemon supervisor + PID file
+- SQLite persistence + recovery-manager
 
 ---
 
-## Phase 3: 확장 — SQLite + Daemon + Claude Reviewer
+## Phase 3: 확장 — UDS + SQLite + Daemon + Claude Reviewer
 
-> 목표: persistence, daemon 모드, LLM planner, Claude review, budget
+> 목표: 독립 worker 프로세스, UDS transport, persistence, daemon 모드, LLM planner, Claude review, budget
 
 ### 추가 모듈
 
 | File | LOC | Purpose |
 |---|---|---|
+| `lib/transport/uds-bus-server.mjs` | ~180 | Unix domain socket 서버 (Phase 2에서 이월) |
+| `lib/transport/uds-bus-client.mjs` | ~140 | Unix domain socket 클라이언트 |
+| `lib/transport/ndjson-codec.mjs` | ~80 | NDJSON encode/decode |
+| `bin/codex-worker.mjs` | ~120 | 독립 worker 프로세스 엔트리 (Phase 2에서 이월) |
 | `lib/storage/session-store-sqlite.mjs` | ~340 | SQLite CRUD |
 | `lib/storage/migrations/001_init.sql` | ~60 | 4테이블 스키마 (workers, tasks, runs, kv) |
 | `lib/runtime/daemon-supervisor.mjs` | ~260 | Daemonize, PID file, attach/stop |
@@ -415,8 +511,8 @@ Captain → TUI:
 | `lib/review/claude-reviewer.mjs` | ~220 | `claude -p` one-shot review |
 | `lib/policy/budget-policy.mjs` | ~180 | Token/cost 제한 |
 | `lib/runtime/llm-planner.mjs` | ~300 | Codex 기반 작업 분해/배정 |
-| `bin/codex-team.mjs` 확장 | +80 | attach/status/stop 서브커맨드 |
-| **Total** | **~1,660** | |
+| `bin/codex-team.mjs` 확장 | +80 | status/stop 서브커맨드 |
+| **Total** | **~2,180** | |
 
 ### SQLite 스키마 (4 테이블)
 
@@ -474,22 +570,22 @@ Phase 1의 단일 작업 모드를 Codex 기반 동적 분해로 확장:
 ## Phase 간 관계
 
 ```
-Phase 1 (MVP)                Phase 2 (완성)              Phase 3 (확장)
+Phase 1 (MVP)                Phase 2 (운영)              Phase 3 (확장)
 ──────────────               ──────────────              ──────────────
-단일 프로세스                  멀티 프로세스                daemon 모드
-in-memory EventEmitter       UDS + NDJSON                + SQLite 영속
-terminal-kit TUI (in-proc)   detachable TUI + attach     attach/detach (daemon)
-단일 작업 모드               + 설정 파일                  + LLM planner
+단일 프로세스                  단일 프로세스 유지            멀티 프로세스 (UDS)
+in-memory EventEmitter       + Captain 제어 API           + SQLite 영속
+terminal-kit TUI (in-proc)   + TUI lifecycle 분리         + daemon 모드
+단일 작업 모드               + Captain 큐 시스템           + LLM planner
 수동 shutdown                + crash recovery             + Claude reviewer
-                             + 구조화 로그                 + budget policy
-~3,230 LOC                   +700 LOC ≈ 3,930            +1,660 LOC ≈ 5,590
+                             + config + 구조화 로그        + budget policy
+~3,230 LOC                   +990 LOC ≈ 4,220            +2,180 LOC ≈ 6,400
 ```
 
 ### 각 Phase 독립성 보장
 
 - **Phase 1 완료 후**: 독립 실행 가능한 제품. `codex-team start "prompt"` 동작
-- **Phase 2 완료 후**: 안정적 운영 가능. worker crash 복구, 설정 관리
-- **Phase 3 완료 후**: 완전한 네이티브급. 지능형 배정, 리뷰, 비용 관리
+- **Phase 2 완료 후**: 운영 가능한 Captain. crash recovery, 큐, TUI detach, 설정 파일
+- **Phase 3 완료 후**: 완전한 네이티브급. UDS 멀티프로세스, 지능형 배정, 리뷰, 비용 관리
 
 ### codex-bridge.mjs와의 관계
 
