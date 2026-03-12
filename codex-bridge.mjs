@@ -13,7 +13,8 @@ const POLL_INTERVAL_MS = 500;
 const POLL_IDLE_MS = 2000;
 const POLL_ACTIVE_MS = 100;
 const SHUTDOWN_POLL_MS = 3000;
-const MAX_RESULT_BYTES = 5 * 1024 * 1024; // 5MB
+const MAX_RESULT_BYTES = 5 * 1024 * 1024; // 5MB (파일 저장용)
+const PREVIEW_CHARS = 500; // inbox 미리보기 글자수
 const TEAMS_BASE = join(homedir(), ".claude", "teams");
 const TASKS_BASE = join(homedir(), ".claude", "tasks");
 const LEADER_NAME = "team-lead";
@@ -813,6 +814,29 @@ function truncateOutput(output) {
   return output;
 }
 
+// ─── 2단계 저장: 전체 결과 → 파일, 미리보기 → inbox ───
+function getResultsDir(teamName) {
+  return join(TEAMS_BASE, sanitize(teamName), "results");
+}
+
+async function saveResultFile(config, output) {
+  const dir = getResultsDir(config.teamName);
+  await mkdir(dir, { recursive: true });
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const filename = `${sanitize(config.agentName)}-${ts}.txt`;
+  const filePath = join(dir, filename);
+  await writeFile(filePath, output, "utf-8");
+  return filePath;
+}
+
+function makePreview(output, filePath) {
+  if (output.length <= PREVIEW_CHARS) {
+    return output; // 짧으면 그대로
+  }
+  const preview = output.slice(0, PREVIEW_CHARS).trimEnd();
+  return `${preview}\n\n... [전체 결과(${output.length}자): ${filePath}]`;
+}
+
 function formatRpcError(error) {
   if (!error) return "unknown RPC error";
   if (typeof error === "string") return error;
@@ -1315,7 +1339,7 @@ async function pollLoop(config) {
   }
 
   // 턴 완료 핸들러: 결과를 리더에게 전송
-  function handleTurnResult(result) {
+  async function handleTurnResult(result) {
     activeTurnPromise = null;
     steerChain = Promise.resolve();
     if (!running) return;
@@ -1334,14 +1358,26 @@ async function pollLoop(config) {
     }
 
     if (result.success) {
-      void sendToLeaderWithRetry(config, result.output, "Codex task completed");
+      // 2단계 저장: 전체 → 파일, 미리보기 → inbox
+      const filePath = await saveResultFile(config, result.output).catch((e) => {
+        log("SAVE-ERR", `result file save failed: ${e.message}`);
+        return null;
+      });
+      const msg = filePath
+        ? makePreview(result.output, filePath)
+        : result.output;
+      void sendToLeaderWithRetry(config, msg, "Codex task completed");
       markMyTasksCompleted(config).catch(() => {});
       sendIdleNotification(config, {
         summary: "Task completed, ready for next",
         completedStatus: "completed",
       }).catch(() => {});
     } else {
-      const errMsg = `[ERROR] Codex failed:\n${result.output}`;
+      const fullErr = `[ERROR] Codex failed:\n${result.output}`;
+      const filePath = await saveResultFile(config, fullErr).catch(() => null);
+      const errMsg = filePath
+        ? makePreview(fullErr, filePath)
+        : fullErr;
       void sendToLeaderWithRetry(config, errMsg, "Codex task failed");
       sendIdleNotification(config, {
         idleReason: "error",
@@ -1351,7 +1387,7 @@ async function pollLoop(config) {
     }
   }
 
-  function handleTurnError(err) {
+  async function handleTurnError(err) {
     activeTurnPromise = null;
     steerChain = Promise.resolve();
     if (!running) return;
@@ -1369,7 +1405,11 @@ async function pollLoop(config) {
       return;
     }
 
-    const errMsg = `[ERROR] Codex app-server error: ${err.message}`;
+    const fullErr = `[ERROR] Codex app-server error: ${err.message}`;
+    const filePath = await saveResultFile(config, fullErr).catch(() => null);
+    const errMsg = filePath
+      ? makePreview(fullErr, filePath)
+      : fullErr;
     void sendToLeaderWithRetry(config, errMsg, "Codex task failed");
     sendIdleNotification(config, {
       idleReason: "error",
@@ -1609,13 +1649,13 @@ async function main() {
     spawn("tmux", ["select-pane", "-l"], { stdio: "ignore", detached: true }).unref();
   } catch { /* tmux 없는 환경에서는 무시 */ }
 
-  // TUI 뷰어 스폰
-  viewerProc = spawnTuiViewer(config.agentName);
-
-  // 뷰어 활성화 시 stderr 로그를 파일로 리다이렉트
-  if (viewerProc) {
-    initLogFile(config.agentName);
+  // TUI 뷰어 스폰 — CODEX_BRIDGE_TUI=1 명시 시에만 (기본: ANSI fallback)
+  if (process.env.CODEX_BRIDGE_TUI === "1") {
+    viewerProc = spawnTuiViewer(config.agentName);
   }
+
+  // ANSI 출력이 stderr로 가므로 항상 로그 파일로 분리
+  initLogFile(config.agentName);
 
   setupSignalHandlers(config);
   await pollLoop(config);
