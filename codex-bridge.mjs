@@ -164,6 +164,8 @@ const renderState = {
   lastTokenTotal: 0,
   lastCmd: null, // 현재 실행 중인 명령어 정보
   headerPrinted: false, // 세션 헤더 출력 여부
+  // codex/event/agent_message_content_delta를 수신한 아이템 추적 (중복 렌더링 방지)
+  itemsWithNewDelta: new Set(),
 };
 
 function renderWrite(text) {
@@ -177,6 +179,7 @@ function endStreamMode() {
     }
     renderState.mode = "idle";
     renderState.lastItemId = null;
+    renderState.itemsWithNewDelta.clear();
   }
 }
 
@@ -220,7 +223,10 @@ function renderNotificationANSI(method, params) {
     }
 
     // ── 에이전트 메시지 스트리밍 ──
+    // codex/event/agent_message_content_delta와 중복 발화됨 — 새 이벤트가 먼저 오므로
+    // 이미 새 이벤트로 처리된 아이템이면 스킵
     case "item/agentMessage/delta": {
+      if (params.itemId && renderState.itemsWithNewDelta.has(params.itemId)) break;
       if (renderState.mode !== "agent" || renderState.lastItemId !== params.itemId) {
         endStreamMode();
         renderLabel("codex");
@@ -228,6 +234,23 @@ function renderNotificationANSI(method, params) {
         renderState.lastItemId = params.itemId;
       }
       renderWrite(params.delta || "");
+      break;
+    }
+
+    // ── 에이전트 메시지 스트리밍 (Codex 0.114+ 새 이벤트) ──
+    // item/agentMessage/delta보다 먼저 발화됨 — 우선 렌더링하고 아이템 추적
+    case "codex/event/agent_message_content_delta": {
+      const msg = params.msg || {};
+      const itemId = msg.item_id || params.itemId;
+      if (itemId) renderState.itemsWithNewDelta.add(itemId);
+      const delta = msg.delta || params.delta || "";
+      if (renderState.mode !== "agent" || renderState.lastItemId !== itemId) {
+        endStreamMode();
+        renderLabel("codex");
+        renderState.mode = "agent";
+        renderState.lastItemId = itemId;
+      }
+      renderWrite(delta);
       break;
     }
 
@@ -472,7 +495,7 @@ function findTuiBin() {
   } catch {}
   // 3. Known build paths
   const knownPaths = [
-    join(homedir(), "argoss", "_external", "openai-codex", "codex-rs", "target", "release", "codex-tui"),
+    join(homedir(), ".cargo", "bin", "codex-tui"),
     join(homedir(), ".local", "bin", "codex-tui"),
     "/usr/local/bin/codex-tui",
   ];
@@ -1052,16 +1075,39 @@ class AppServerSession {
       return;
     }
 
+    // 레거시 스트리밍 이벤트 — 새 이벤트(codex/event/...)로 이미 캡처된 아이템은 스킵
     if (method === "item/agentMessage/delta") {
       const current = this.currentTurn;
       if (!current) return;
       if (current.turnId && params.turnId !== current.turnId) return;
+      // 새 이벤트에서 이미 캡처 중이면 중복 방지
+      if (params.itemId && current.itemsWithDelta.has(params.itemId)) return;
       if (typeof params.delta === "string") {
         current.chunks.push(params.delta);
         if (params.itemId) current.itemsWithDelta.add(params.itemId);
       }
       if (!current.turnId && params.turnId) {
         current.turnId = params.turnId;
+      }
+      return;
+    }
+
+    // Codex 0.114+ 새 스트리밍 이벤트 — item/agentMessage/delta보다 먼저 발화됨
+    // 우선 chunk 캡처하고 아이템 추적
+    if (method === "codex/event/agent_message_content_delta") {
+      const current = this.currentTurn;
+      if (!current) return;
+      const msg = params.msg || {};
+      const turnId = msg.turn_id || params.turnId;
+      if (current.turnId && turnId && current.turnId !== turnId) return;
+      const itemId = msg.item_id || params.itemId;
+      const delta = msg.delta || params.delta;
+      if (typeof delta === "string") {
+        current.chunks.push(delta);
+        if (itemId) current.itemsWithDelta.add(itemId);
+      }
+      if (!current.turnId && turnId) {
+        current.turnId = turnId;
       }
       return;
     }
@@ -1493,7 +1539,7 @@ function setupSignalHandlers(config) {
 function passthroughToClaude() {
   const claudeBin = process.env.CLAUDE_BIN
     || spawnSync("which", ["claude"], { encoding: "utf8", timeout: 3000 }).stdout?.trim()
-    || "/root/.local/bin/claude";
+    || join(homedir(), ".local", "bin", "claude");
   const originalArgs = process.argv.slice(2);
   log("PASSTHROUGH", `Forwarding to Claude Code: ${claudeBin}`);
 

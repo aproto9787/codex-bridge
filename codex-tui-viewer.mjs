@@ -75,6 +75,7 @@ const state = {
   pendingChunks: [],
   renderTimer: null,
   headerDirty: true,
+  itemsWithNewDelta: new Set(),
   statusDirty: true,
   exiting: false,
 };
@@ -176,6 +177,7 @@ function appendLabel(label) {
 
 function endStreamMode() {
   state.lastItemId = null;
+  state.itemsWithNewDelta.clear();
   updateStatusBar({ mode: "idle" });
 }
 
@@ -202,6 +204,7 @@ function handleNotification(method, params = {}) {
 
     case "item/agentMessage/delta": {
       const itemId = resolveItemId(params);
+      if (itemId && state.itemsWithNewDelta.has(itemId)) break;
       if (state.mode !== "agent" || state.lastItemId !== itemId) {
         endStreamMode();
         appendLabel("codex");
@@ -209,6 +212,21 @@ function handleNotification(method, params = {}) {
         updateStatusBar({ mode: "agent" });
       }
       appendContent(escapeTags(params.delta || ""));
+      break;
+    }
+
+    case "codex/event/agent_message_content_delta": {
+      const msg = params.msg || {};
+      const itemId = msg.item_id || resolveItemId(params);
+      if (itemId) state.itemsWithNewDelta.add(itemId);
+      const delta = msg.delta || params.delta || "";
+      if (state.mode !== "agent" || state.lastItemId !== itemId) {
+        endStreamMode();
+        appendLabel("codex");
+        state.lastItemId = itemId;
+        updateStatusBar({ mode: "agent" });
+      }
+      appendContent(escapeTags(delta));
       break;
     }
 
