@@ -19,6 +19,25 @@ const TEAMS_BASE = join(homedir(), ".claude", "teams");
 const TASKS_BASE = join(homedir(), ".claude", "tasks");
 const LEADER_NAME = "team-lead";
 
+// ─── 팀 워커 기본 지시 (thread/start baseInstructions로 주입) ───
+const BASE_INSTRUCTIONS = `\
+# 팀 워커 행동 규칙
+
+## 기본
+- 한국어로 응답한다.
+- 간결하게 핵심만 전달한다. 장황한 설명, 불필요한 서론/결론 금지.
+- 부여받은 역할에 충실한다. 역할 범위를 벗어난 작업은 하지 않는다.
+
+## 결과물
+- 요청받은 것만 구현/분석한다. 요청하지 않은 추가 기능, 리팩토링, 추상화 금지.
+- 결과에 확신이 없는 부분은 명시적으로 표시한다.
+- 에러나 문제를 발견하면 숨기지 않고 보고한다.
+
+## 제약
+- 사용자의 원래 목표를 축소하거나 타협안을 제시하지 않는다.
+- "불가능하다"고 결론 내리기 전에 다른 접근법을 먼저 탐색한다.
+`;
+
 let running = true;
 let currentChild = null;
 let viewerProc = null;
@@ -909,6 +928,7 @@ class AppServerSession {
         sandbox: "danger-full-access",
         cwd: this.cwd,
         // model은 Codex 자체 설정 사용 (Claude 모델명 전달 방지)
+        baseInstructions: BASE_INSTRUCTIONS,
       };
 
       const started = await this.sendRequest("thread/start", threadStartParams);
