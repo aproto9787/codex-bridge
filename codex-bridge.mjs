@@ -3,7 +3,7 @@
 // zero-dependency (Node.js 내장 모듈만 사용)
 
 import { readFile, writeFile, mkdir, rmdir, rename, stat as fsStat } from "node:fs/promises";
-import { existsSync, createWriteStream } from "node:fs";
+import { existsSync, createWriteStream, openSync, closeSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
@@ -41,6 +41,8 @@ const BASE_INSTRUCTIONS = `\
 let running = true;
 let currentChild = null;
 let viewerProc = null;
+let viewerFifoPath = null;   // tmux FIFO 경로 (cleanup용)
+let viewerTmuxPaneId = null; // tmux pane ID (cleanup용)
 let logStream = null;
 // Real session info from app-server (populated after thread/start)
 let sessionInfo = null;
@@ -158,6 +160,17 @@ function closeViewer() {
   } catch {
     // best effort
   }
+  // tmux pane cleanup
+  if (viewerTmuxPaneId) {
+    try {
+      spawnSync("tmux", ["kill-pane", "-t", viewerTmuxPaneId], { stdio: "ignore", timeout: 2000 });
+    } catch {}
+    viewerTmuxPaneId = null;
+  }
+  if (viewerFifoPath) {
+    try { unlinkSync(viewerFifoPath); } catch {}
+    viewerFifoPath = null;
+  }
   viewerProc = null;
 }
 
@@ -262,14 +275,14 @@ function renderNotificationANSI(method, params) {
     case "codex/event/agent_message_content_delta": {
       const msg = params.msg || {};
       const itemId = msg.item_id || params.itemId;
-      if (itemId) renderState.itemsWithNewDelta.add(itemId);
       const delta = msg.delta || params.delta || "";
       if (renderState.mode !== "agent" || renderState.lastItemId !== itemId) {
-        endStreamMode();
+        endStreamMode(); // clears itemsWithNewDelta
         renderLabel("codex");
         renderState.mode = "agent";
         renderState.lastItemId = itemId;
       }
+      if (itemId) renderState.itemsWithNewDelta.add(itemId); // add AFTER endStreamMode
       renderWrite(delta);
       break;
     }
@@ -526,9 +539,8 @@ function findTuiBin() {
 }
 
 function spawnTuiViewer(agentName) {
-  // Try real Codex TUI binary first (patched with --pipe-fd support)
+  // Real Codex TUI binary (--pipe-fd support) — 존재할 때만
   let tuiBin = findTuiBin();
-
   if (tuiBin && existsSync(tuiBin)) {
     const realVersion = getCodexVersion();
     log("TUI", `spawning real codex-tui: ${tuiBin} (codex version: ${realVersion || "unknown"})`);
@@ -544,22 +556,86 @@ function spawnTuiViewer(agentName) {
     return proc;
   }
 
-  // Fallback: blessed-based viewer
-  const viewerPath = join(import.meta.dirname || new URL(".", import.meta.url).pathname, "codex-tui-viewer.mjs");
-  if (!existsSync(viewerPath)) {
-    log("TUI", "no viewer binary found, using ANSI fallback");
+  log("TUI", "no codex-tui binary found, using ANSI fallback");
+  return null;
+}
+
+// ─── tmux pane 기반 TUI 뷰어 ───
+function spawnTuiTmuxPane(agentName) {
+  const fifoPath = `/tmp/codex-tui-${process.pid}.fifo`;
+
+  // FIFO 생성
+  try { unlinkSync(fifoPath); } catch {}
+  const mkResult = spawnSync("mkfifo", [fifoPath], { timeout: 3000 });
+  if (mkResult.status !== 0) {
+    log("TUI", `mkfifo failed: ${mkResult.stderr?.toString().trim()}`);
     return null;
   }
 
-  log("TUI", "real codex-tui not found, falling back to blessed viewer");
-  const proc = spawn("node", [viewerPath, "--name", agentName], {
-    stdio: ["pipe", "inherit", "pipe"],
-    env: { ...process.env, FORCE_COLOR: "1" },
+  // tmux pane에서 Ink 뷰어 실행
+  const baseDir = import.meta.dirname || new URL(".", import.meta.url).pathname;
+  const viewerPath = join(baseDir, "codex-ink-viewer.mjs");
+  if (!existsSync(viewerPath)) {
+    log("TUI", "codex-ink-viewer.mjs not found, cannot spawn tmux pane");
+    try { unlinkSync(fifoPath); } catch {}
+    return null;
+  }
+
+  const cmd = `exec node ${JSON.stringify(viewerPath)} --name ${JSON.stringify(agentName)} --fifo ${JSON.stringify(fifoPath)}`;
+  const splitResult = spawnSync("tmux", [
+    "split-window", "-h", "-l", "45%",
+    "-P", "-F", "#{pane_id}",  // pane ID 출력
+    cmd,
+  ], { encoding: "utf8", timeout: 5000 });
+
+  if (splitResult.status !== 0) {
+    log("TUI", `tmux split-window failed: ${splitResult.stderr?.trim()}`);
+    try { unlinkSync(fifoPath); } catch {}
+    return null;
+  }
+
+  const paneId = (splitResult.stdout || "").trim();
+  log("TUI", `tmux pane created: ${paneId}`);
+
+  // bridge pane을 백그라운드 윈도우로 숨기고 Ink pane만 보이게
+  try {
+    // Ink pane에 포커스 → bridge pane을 break-pane으로 숨김
+    spawnSync("tmux", ["select-pane", "-t", paneId], { stdio: "ignore", timeout: 2000 });
+    spawnSync("tmux", ["break-pane", "-d", "-s", process.env.TMUX_PANE], { stdio: "ignore", timeout: 2000 });
+    // 리더 pane으로 포커스 복원 (원래 있던 곳)
+    spawnSync("tmux", ["select-pane", "-l"], { stdio: "ignore", timeout: 2000 });
+  } catch {
+    // fallback: break-pane 실패하면 그냥 포커스만 복원
+    try { spawnSync("tmux", ["select-pane", "-l"], { stdio: "ignore", timeout: 2000 }); } catch {}
+  }
+
+  // FIFO를 O_RDWR로 열기 (blocking 방지 Unix 트릭)
+  let fd;
+  try {
+    fd = openSync(fifoPath, "r+"); // O_RDWR → reader 없어도 block 안 됨
+  } catch (err) {
+    log("TUI", `FIFO open failed: ${err.message}`);
+    try { spawnSync("tmux", ["kill-pane", "-t", paneId], { stdio: "ignore" }); } catch {}
+    try { unlinkSync(fifoPath); } catch {}
+    return null;
+  }
+
+  const stream = createWriteStream(null, { fd, autoClose: true });
+  stream.on("error", (err) => {
+    log("TUI", `FIFO write error: ${err.code || err.message}`);
+    viewerProc = null;
   });
-  proc.viewerType = "blessed";
-  attachViewerHandlers(proc);
-  log("TUI", `blessed viewer spawned (pid=${proc.pid})`);
-  return proc;
+
+  // viewerProc 호환 객체 (renderNotification이 viewerProc.stdin 사용)
+  viewerFifoPath = fifoPath;
+  viewerTmuxPaneId = paneId;
+
+  return {
+    stdin: stream,
+    viewerType: "blessed",
+    _sessionSent: false,
+    _isTmux: true,
+  };
 }
 
 function attachViewerHandlers(proc) {
@@ -1664,14 +1740,24 @@ async function main() {
   log("INFO", `cwd=${process.cwd()}`);
   log("INFO", `pid=${process.pid}`);
 
-  // 스폰 후 리더 pane으로 포커스 자동 복원
-  try {
-    spawn("tmux", ["select-pane", "-l"], { stdio: "ignore", detached: true }).unref();
-  } catch { /* tmux 없는 환경에서는 무시 */ }
-
-  // TUI 뷰어 스폰 — CODEX_BRIDGE_TUI=1 명시 시에만 (기본: ANSI fallback)
-  if (process.env.CODEX_BRIDGE_TUI === "1") {
+  // TUI 뷰어 스폰 — tmux 환경이면 자동으로 tmux pane, 아니면 CODEX_BRIDGE_TUI=1일 때 자식 프로세스
+  if (process.env.CODEX_BRIDGE_TUI === "0") {
+    // 명시적 비활성 → ANSI fallback
+    log("TUI", "TUI explicitly disabled, using ANSI fallback");
+  } else if (process.env.TMUX) {
+    // tmux 환경 → tmux pane에 뷰어 (기본 활성)
+    viewerProc = spawnTuiTmuxPane(config.agentName);
+    if (!viewerProc) {
+      log("TUI", "tmux pane spawn failed, falling back to ANSI");
+    }
+  } else if (process.env.CODEX_BRIDGE_TUI === "1") {
+    // tmux 없지만 TUI 명시 → 자식 프로세스 방식
     viewerProc = spawnTuiViewer(config.agentName);
+  } else {
+    // tmux 없고 TUI 미지정 → ANSI fallback
+    try {
+      spawn("tmux", ["select-pane", "-l"], { stdio: "ignore", detached: true }).unref();
+    } catch {}
   }
 
   // ANSI 출력이 stderr로 가므로 항상 로그 파일로 분리
