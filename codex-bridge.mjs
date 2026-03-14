@@ -3,8 +3,8 @@
 // zero-dependency (Node.js 내장 모듈만 사용)
 
 import { readFile, writeFile, mkdir, rmdir, rename, stat as fsStat } from "node:fs/promises";
-import { existsSync, createWriteStream, openSync, closeSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, createWriteStream, openSync, closeSync, unlinkSync, watch as fsWatch } from "node:fs";
+import { join, basename } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 
@@ -12,6 +12,8 @@ import { homedir } from "node:os";
 const POLL_INTERVAL_MS = 500;
 const POLL_IDLE_MS = 2000;
 const POLL_ACTIVE_MS = 100;
+const POLL_FALLBACK_MS = 5000; // fs.watch fallback timeout
+const FLUSH_DEBOUNCE_MS = 50;  // leader outbox micro-batch 간격
 const SHUTDOWN_POLL_MS = 3000;
 const MAX_RESULT_BYTES = 5 * 1024 * 1024; // 5MB (파일 저장용)
 const PREVIEW_CHARS = 500; // inbox 미리보기 글자수
@@ -33,12 +35,19 @@ const BASE_INSTRUCTIONS = `\
 - 결과에 확신이 없는 부분은 명시적으로 표시한다.
 - 에러나 문제를 발견하면 숨기지 않고 보고한다.
 
+## 멀티에이전트 활용
+- 복잡한 태스크는 서브에이전트를 스폰하여 병렬 처리할 수 있다.
+- 서브에이전트 활용 기준: 독립적으로 분할 가능한 하위 작업이 2개 이상일 때.
+- 단순 작업(파일 1~2개 수정, 단일 함수 구현 등)은 직접 처리한다.
+- 서브에이전트에게도 동일한 행동 규칙(간결, 범위 준수, 과잉 금지)을 적용한다.
+
 ## 제약
 - 사용자의 원래 목표를 축소하거나 타협안을 제시하지 않는다.
 - "불가능하다"고 결론 내리기 전에 다른 접근법을 먼저 탐색한다.
 `;
 
 let running = true;
+let shutdownRequested = false;
 let currentChild = null;
 let viewerProc = null;
 let viewerFifoPath = null;   // tmux FIFO 경로 (cleanup용)
@@ -46,8 +55,9 @@ let viewerTmuxPaneId = null; // tmux pane ID (cleanup용)
 let logStream = null;
 // Real session info from app-server (populated after thread/start)
 let sessionInfo = null;
-let lastInboxMtime = 0;
 let currentPollMs = POLL_INTERVAL_MS;
+let leaderOutbox = null; // pollLoop에서 초기화
+let _borderAgentName = null; // border-status용 에이전트 이름 (main에서 설정)
 
 // ─── Inline mkdir-based Lock (proper-lockfile compatible) ───
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -190,6 +200,21 @@ const ANSI = {
   gray: "\x1b[90m",
 };
 
+// ─── Width-aware truncation helpers ───
+function getPaneWidth() {
+  try {
+    const cols = process.stderr.columns || 80;
+    return Math.max(cols, 40);
+  } catch { return 80; }
+}
+
+function truncateMiddle(str, maxLen) {
+  if (!str || str.length <= maxLen) return str;
+  const ellipsis = "...";
+  const half = Math.floor((maxLen - ellipsis.length) / 2);
+  return str.slice(0, half) + ellipsis + str.slice(str.length - half);
+}
+
 // 현재 렌더링 상태 (스트리밍 모드 추적)
 const renderState = {
   mode: "idle", // "idle" | "agent" | "exec" | "file" | "reasoning"
@@ -199,7 +224,28 @@ const renderState = {
   headerPrinted: false, // 세션 헤더 출력 여부
   // codex/event/agent_message_content_delta를 수신한 아이템 추적 (중복 렌더링 방지)
   itemsWithNewDelta: new Set(),
+  // exec outputDelta를 스트리밍한 아이템 추적 (완료 시 aggregatedOutput 중복 방지)
+  execStreamedItems: new Set(),
+  // ── Compact mode state ──
+  compactMode: process.env.CODEX_BRIDGE_VERBOSE !== "1",
+  currentPhase: "idle",        // idle/exec/patch/search/plan/thinking
+  lastMeaningfulEvent: "",     // 1-line summary of last significant event
+  suppressedLines: 0,          // count of hidden output lines
+  recentEvents: [],            // ring buffer, max 6 entries
+  tailBuffer: [],              // last 20 lines of raw output for failure expansion
+  turnStartedAt: 0,            // timestamp for elapsed time display
 };
+
+// 핵심 이벤트를 로그 + ANSI pane 양쪽에 출력
+function logAndRender(tag, msg) {
+  log(tag, msg);
+  renderWrite(`${ANSI.yellow}[${tag}]${ANSI.reset} ${msg}\n`);
+}
+
+function logAndRenderError(tag, msg) {
+  log(tag, msg);
+  renderWrite(`${ANSI.red}${ANSI.bold}[${tag}]${ANSI.reset} ${msg}\n`);
+}
 
 function renderWrite(text) {
   process.stderr.write(text);
@@ -217,8 +263,8 @@ function endStreamMode() {
 }
 
 // Codex exec 스타일: "label\ncontent" 형식의 섹션 헤더
-function renderLabel(label) {
-  renderWrite(`${ANSI.bold}${ANSI.cyan}${label}${ANSI.reset}\n`);
+function renderLabel(label, color = ANSI.cyan) {
+  renderWrite(`${ANSI.bold}${color}${label}${ANSI.reset}\n`);
 }
 
 function renderSessionHeader() {
@@ -227,14 +273,98 @@ function renderSessionHeader() {
   renderWrite(`${ANSI.dim}--------${ANSI.reset}\n`);
 }
 
+// ── Compact mode helpers ──
+function addRecentEvent(text) {
+  renderState.recentEvents.push(text);
+  if (renderState.recentEvents.length > 6) {
+    renderState.recentEvents.shift();
+  }
+  renderState.lastMeaningfulEvent = text;
+}
+
+function addToTailBuffer(line) {
+  renderState.tailBuffer.push(line);
+  if (renderState.tailBuffer.length > 20) {
+    renderState.tailBuffer.shift();
+  }
+}
+
+function formatElapsed(ms) {
+  const totalSec = Math.floor(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `t+${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+const PHASE_LABELS = {
+  idle: "IDLE",
+  exec: "EXEC",
+  patch: "PATCH",
+  search: "SEARCH",
+  plan: "PLAN",
+  thinking: "THINK",
+};
+
+const PHASE_COLORS = {
+  idle: ANSI.dim,
+  exec: ANSI.yellow,
+  patch: ANSI.cyan,
+  search: ANSI.blue,
+  plan: ANSI.magenta,
+  thinking: ANSI.dim,
+};
+
+function renderCompactView() {
+  if (!renderState.compactMode) return;
+  // Clear pane: move cursor to top-left and clear screen
+  renderWrite("\x1b[2J\x1b[H");
+  // Phase header line with elapsed time
+  const phaseTag = PHASE_LABELS[renderState.currentPhase] || renderState.currentPhase.toUpperCase();
+  const elapsed = renderState.turnStartedAt > 0
+    ? formatElapsed(Date.now() - renderState.turnStartedAt)
+    : "t+00:00";
+  const pw = getPaneWidth();
+  const summaryMax = pw - phaseTag.length - 2 - 10; // margin for [TAG] + elapsed
+  const summary = renderState.lastMeaningfulEvent
+    ? `  ${truncateMiddle(renderState.lastMeaningfulEvent, summaryMax)}`
+    : "";
+  const phaseColor = PHASE_COLORS[renderState.currentPhase] || ANSI.cyan;
+  renderWrite(`${ANSI.bold}${phaseColor}[${phaseTag}]${ANSI.reset}${ANSI.dim}${summary}${ANSI.reset}`);
+  // Right-align elapsed time
+  const headerLen = phaseTag.length + 2 + summary.length;
+  const pad = Math.max(1, pw - 20 - headerLen);
+  renderWrite(`${" ".repeat(pad)}${ANSI.dim}${elapsed}${ANSI.reset}\n`);
+  // Recent events list
+  const evMax = pw - 6; // margin for "  • " prefix
+  for (const ev of renderState.recentEvents) {
+    renderWrite(`  ${ANSI.dim}\u2022${ANSI.reset} ${truncateMiddle(ev, evMax)}\n`);
+  }
+  // Suppressed count
+  if (renderState.suppressedLines > 0) {
+    renderWrite(`  ${ANSI.dim}(${renderState.suppressedLines} lines hidden)${ANSI.reset}\n`);
+  }
+  // Update tmux border-status header alongside compact view
+  if (_borderAgentName) updateBorderStatus(_borderAgentName);
+}
+
 function renderNotificationANSI(method, params) {
   if (!params) return;
+  const compact = renderState.compactMode;
 
   switch (method) {
     // ── 턴 시작 ──
     case "turn/started": {
       endStreamMode();
-      renderSessionHeader();
+      if (compact) {
+        renderState.turnStartedAt = Date.now();
+        renderState.currentPhase = "idle";
+        renderState.suppressedLines = 0;
+        renderState.recentEvents = [];
+        renderState.tailBuffer = [];
+        renderCompactView();
+      } else {
+        renderSessionHeader();
+      }
       break;
     }
 
@@ -243,15 +373,31 @@ function renderNotificationANSI(method, params) {
       endStreamMode();
       const turn = params.turn || {};
       const status = turn.status || "unknown";
-      if (renderState.lastTokenTotal > 0) {
-        renderWrite(`${ANSI.bold}tokens used${ANSI.reset}\n`);
-        renderWrite(`${renderState.lastTokenTotal.toLocaleString()}\n`);
+      if (compact) {
+        renderState.currentPhase = "idle";
+        const durStr = renderState.turnStartedAt > 0
+          ? formatElapsed(Date.now() - renderState.turnStartedAt)
+          : "";
+        const tokStr = renderState.lastTokenTotal > 0
+          ? ` | ${renderState.lastTokenTotal.toLocaleString()} tokens`
+          : "";
+        addRecentEvent(`turn ${status} (${durStr}${tokStr})`);
+        renderState.turnStartedAt = 0;
+        renderCompactView();
+        if (status !== "completed") {
+          renderWrite(`${ANSI.red}${ANSI.bold}[ERR]${ANSI.reset} ${ANSI.red}turn ${status}${ANSI.reset}\n`);
+        }
+      } else {
+        if (renderState.lastTokenTotal > 0) {
+          renderWrite(`${ANSI.bold}tokens used${ANSI.reset}\n`);
+          renderWrite(`${ANSI.dim}${renderState.lastTokenTotal.toLocaleString()}${ANSI.reset}\n`);
+        }
+        renderWrite(`${ANSI.dim}--------${ANSI.reset}\n`);
+        if (status !== "completed") {
+          renderWrite(`${ANSI.red}${ANSI.bold}[ERR]${ANSI.reset} ${ANSI.red}turn ${status}${ANSI.reset}\n`);
+        }
+        renderState.headerPrinted = false;
       }
-      renderWrite(`${ANSI.dim}--------${ANSI.reset}\n`);
-      if (status !== "completed") {
-        renderWrite(`${ANSI.red}turn ${status}${ANSI.reset}\n`);
-      }
-      renderState.headerPrinted = false;
       break;
     }
 
@@ -260,13 +406,19 @@ function renderNotificationANSI(method, params) {
     // 이미 새 이벤트로 처리된 아이템이면 스킵
     case "item/agentMessage/delta": {
       if (params.itemId && renderState.itemsWithNewDelta.has(params.itemId)) break;
-      if (renderState.mode !== "agent" || renderState.lastItemId !== params.itemId) {
-        endStreamMode();
-        renderLabel("codex");
-        renderState.mode = "agent";
-        renderState.lastItemId = params.itemId;
+      if (compact) {
+        renderState.suppressedLines++;
+        addToTailBuffer(params.delta || "");
+        // accumulate text for summary on completion — no render
+      } else {
+        if (renderState.mode !== "agent" || renderState.lastItemId !== params.itemId) {
+          endStreamMode();
+          renderLabel("codex");
+          renderState.mode = "agent";
+          renderState.lastItemId = params.itemId;
+        }
+        renderWrite(params.delta || "");
       }
-      renderWrite(params.delta || "");
       break;
     }
 
@@ -276,48 +428,73 @@ function renderNotificationANSI(method, params) {
       const msg = params.msg || {};
       const itemId = msg.item_id || params.itemId;
       const delta = msg.delta || params.delta || "";
-      if (renderState.mode !== "agent" || renderState.lastItemId !== itemId) {
-        endStreamMode(); // clears itemsWithNewDelta
-        renderLabel("codex");
-        renderState.mode = "agent";
-        renderState.lastItemId = itemId;
+      if (compact) {
+        if (itemId) renderState.itemsWithNewDelta.add(itemId);
+        renderState.suppressedLines++;
+        addToTailBuffer(delta);
+      } else {
+        if (renderState.mode !== "agent" || renderState.lastItemId !== itemId) {
+          endStreamMode(); // clears itemsWithNewDelta
+          renderLabel("codex");
+          renderState.mode = "agent";
+          renderState.lastItemId = itemId;
+        }
+        if (itemId) renderState.itemsWithNewDelta.add(itemId); // add AFTER endStreamMode
+        renderWrite(delta);
       }
-      if (itemId) renderState.itemsWithNewDelta.add(itemId); // add AFTER endStreamMode
-      renderWrite(delta);
       break;
     }
 
     // ── 명령 실행 출력 (스트리밍) ──
     case "item/commandExecution/outputDelta": {
-      if (renderState.mode !== "exec" || renderState.lastItemId !== params.itemId) {
-        endStreamMode();
-        renderState.mode = "exec";
-        renderState.lastItemId = params.itemId;
+      if (compact) {
+        if (params.itemId) renderState.execStreamedItems.add(params.itemId);
+        renderState.suppressedLines++;
+        addToTailBuffer(params.delta || "");
+        // periodic compact refresh (every 20 suppressed lines)
+        if (renderState.suppressedLines % 20 === 0) renderCompactView();
+      } else {
+        if (renderState.mode !== "exec" || renderState.lastItemId !== params.itemId) {
+          endStreamMode();
+          renderState.mode = "exec";
+          renderState.lastItemId = params.itemId;
+        }
+        if (params.itemId) renderState.execStreamedItems.add(params.itemId);
+        renderWrite(params.delta || "");
       }
-      renderWrite(params.delta || "");
       break;
     }
 
     // ── 파일 변경 출력 ──
     case "item/fileChange/outputDelta": {
-      if (renderState.mode !== "file" || renderState.lastItemId !== params.itemId) {
-        endStreamMode();
-        renderState.mode = "file";
-        renderState.lastItemId = params.itemId;
+      if (compact) {
+        renderState.suppressedLines++;
+        addToTailBuffer(params.delta || "");
+      } else {
+        if (renderState.mode !== "file" || renderState.lastItemId !== params.itemId) {
+          endStreamMode();
+          renderState.mode = "file";
+          renderState.lastItemId = params.itemId;
+        }
+        renderWrite(`${ANSI.cyan}${params.delta || ""}${ANSI.reset}`);
       }
-      renderWrite(`${ANSI.yellow}${params.delta || ""}${ANSI.reset}`);
       break;
     }
 
     // ── 추론 요약 스트리밍 ──
     case "item/reasoning/summaryTextDelta": {
-      if (renderState.mode !== "reasoning" || renderState.lastItemId !== params.itemId) {
-        endStreamMode();
-        renderWrite(`${ANSI.dim}${ANSI.italic}`);
-        renderState.mode = "reasoning";
-        renderState.lastItemId = params.itemId;
+      if (compact) {
+        renderState.suppressedLines++;
+        // completely suppress reasoning deltas in compact mode
+      } else {
+        if (renderState.mode !== "reasoning" || renderState.lastItemId !== params.itemId) {
+          endStreamMode();
+          renderWrite(`${ANSI.dim}${ANSI.italic}`);
+          renderState.mode = "reasoning";
+          renderState.lastItemId = params.itemId;
+        }
+        renderWrite(params.delta || "");
       }
-      renderWrite(params.delta || "");
       break;
     }
 
@@ -332,18 +509,43 @@ function renderNotificationANSI(method, params) {
           cwd: item.cwd,
           startTime: Date.now(),
         };
-        // exec 헤더는 item/completed에서 결과와 함께 출력 (Codex 스타일)
+        if (compact) {
+          const cmdShort = truncateMiddle(item.command || "", getPaneWidth() - 12);
+          addRecentEvent(`exec: ${cmdShort}`);
+          renderState.currentPhase = "exec";
+          renderCompactView();
+        } else {
+          // exec 시작 헤더를 즉시 출력 (스트리밍 중 명령 식별)
+          const cmdW = getPaneWidth() - 16;
+          renderLabel("[RUN] exec", ANSI.yellow);
+          renderWrite(`${ANSI.dim}\u25b6 ${truncateMiddle(item.command || "", cmdW)} in ${truncateMiddle(item.cwd || "", 30)}${ANSI.reset}\n`);
+        }
       } else if (item.type === "fileChange") {
         endStreamMode();
-        const files = (item.changes || []).map((c) => c.path || c.file || "").filter(Boolean);
-        renderLabel("patch");
-        if (files.length > 0) {
-          renderWrite(`${files.join(", ")}\n`);
+        if (compact) {
+          const files = (item.changes || []).map((c) => c.path || c.file || "").filter(Boolean);
+          const summary = files.length > 0 ? files.map((f) => basename(f)).join(", ") : "files";
+          addRecentEvent(`patch: ${truncateMiddle(summary, getPaneWidth() - 12)}`);
+          renderState.currentPhase = "patch";
+          renderCompactView();
+        } else {
+          const files = (item.changes || []).map((c) => c.path || c.file || "").filter(Boolean);
+          renderLabel("[PATCH] patch", ANSI.cyan);
+          if (files.length > 0) {
+            renderWrite(`${ANSI.dim}${truncateMiddle(files.join(", "), getPaneWidth() - 4)}${ANSI.reset}\n`);
+          }
         }
       } else if (item.type === "webSearch") {
         endStreamMode();
-        renderLabel("web search");
-        renderWrite(`${item.query || ""}\n`);
+        if (compact) {
+          const q = truncateMiddle(item.query || "", getPaneWidth() - 14);
+          addRecentEvent(`search: "${q}"`);
+          renderState.currentPhase = "search";
+          renderCompactView();
+        } else {
+          renderLabel("[SEARCH] web search", ANSI.blue);
+          renderWrite(`${truncateMiddle(item.query || "", getPaneWidth() - 4)}\n`);
+        }
       }
       break;
     }
@@ -353,27 +555,79 @@ function renderNotificationANSI(method, params) {
       const item = params.item;
       if (!item) break;
       if (item.type === "commandExecution") {
+        const alreadyStreamed = item.id && renderState.execStreamedItems.has(item.id);
+        if (item.id) renderState.execStreamedItems.delete(item.id);
         endStreamMode();
-        // Codex exec 스타일: "exec\ncommand in dir succeeded/failed in Xms:\noutput"
-        const dur = item.durationMs != null ? `${item.durationMs}ms` : "";
-        const succeeded = item.exitCode === 0;
-        const statusWord = succeeded
-          ? `${ANSI.green}succeeded${ANSI.reset}`
-          : `${ANSI.red}failed (exit=${item.exitCode})${ANSI.reset}`;
-        renderLabel("exec");
-        renderWrite(`${ANSI.dim}${item.command}${ANSI.reset} in ${item.cwd} ${statusWord} in ${dur}:\n`);
-        if (item.aggregatedOutput) {
-          renderWrite(`${item.aggregatedOutput}${item.aggregatedOutput.endsWith("\n") ? "" : "\n"}`);
+        if (compact) {
+          const dur = item.durationMs != null ? `${(item.durationMs / 1000).toFixed(1)}s` : "";
+          const succeeded = item.exitCode === 0;
+          const statusStr = succeeded ? "exit 0" : `exit ${item.exitCode}`;
+          const suffixLen = statusStr.length + (dur ? dur.length + 2 : 0) + 10;
+          const cmdShort = truncateMiddle(item.command || "", getPaneWidth() - suffixLen);
+          addRecentEvent(`exec: ${cmdShort} (${statusStr}${dur ? `, ${dur}` : ""})`);
+          renderState.currentPhase = "idle";
+          renderState.lastCmd = null;
+          // On failure, dump tail buffer for debugging
+          if (!succeeded) {
+            renderCompactView();
+            renderWrite(`${ANSI.red}${ANSI.bold}[ERR] exec failed (exit=${item.exitCode})${ANSI.reset}\n`);
+            const tail = renderState.tailBuffer.slice(-15);
+            for (const line of tail) {
+              renderWrite(`${ANSI.dim}${line}${ANSI.reset}\n`);
+            }
+            renderWrite(`${ANSI.red}${ANSI.bold}[ERR] end failure output${ANSI.reset}\n`);
+          } else {
+            renderCompactView();
+          }
+        } else {
+          // Codex exec 스타일: "exec\ncommand in dir succeeded/failed in Xms:\noutput"
+          const dur = item.durationMs != null ? `${item.durationMs}ms` : "";
+          const succeeded = item.exitCode === 0;
+          const statusWord = succeeded
+            ? `${ANSI.green}succeeded${ANSI.reset}`
+            : `${ANSI.red}failed (exit=${item.exitCode})${ANSI.reset}`;
+          renderLabel(succeeded ? "[OK] exec" : "[ERR] exec", succeeded ? ANSI.green : ANSI.red);
+          { const _cw = getPaneWidth() - 30; renderWrite(`${ANSI.dim}${truncateMiddle(item.command || "", _cw)} in ${truncateMiddle(item.cwd || "", 30)}${ANSI.reset} ${statusWord} ${ANSI.dim}in ${dur}${ANSI.reset}:\n`); }
+          // 이미 스트리밍된 출력은 재출력하지 않음 (중복 방지)
+          if (item.aggregatedOutput && !alreadyStreamed) {
+            renderWrite(`${item.aggregatedOutput}${item.aggregatedOutput.endsWith("\n") ? "" : "\n"}`);
+          }
+          renderState.lastCmd = null;
         }
-        renderState.lastCmd = null;
       } else if (item.type === "agentMessage") {
-        endStreamMode();
+        if (compact) {
+          // Build 1-line summary from tail buffer (last accumulated text)
+          const fullText = renderState.tailBuffer.join("").replace(/\n/g, " ").trim();
+          if (fullText.length > 0) {
+            addRecentEvent(`agent: ${truncateMiddle(fullText, getPaneWidth() - 12)}`);
+          }
+          renderState.tailBuffer = [];
+          renderState.itemsWithNewDelta.clear();
+          renderCompactView();
+        } else {
+          endStreamMode();
+        }
       } else if (item.type === "fileChange") {
         endStreamMode();
-        const changes = item.changes || [];
-        for (const c of changes) {
-          const path = c.path || c.file || "";
-          if (path) renderWrite(`  ${ANSI.green}+${ANSI.reset} ${path}\n`);
+        if (compact) {
+          const changes = item.changes || [];
+          let added = 0, removed = 0;
+          for (const c of changes) {
+            added += c.additions || 0;
+            removed += c.deletions || 0;
+          }
+          const files = changes.map((c) => basename(c.path || c.file || "")).filter(Boolean);
+          const summary = files.length > 0 ? files.join(", ") : "files";
+          const statsStr = ` +${added}/-${removed}`;
+          addRecentEvent(`patch: ${truncateMiddle(summary, getPaneWidth() - 12 - statsStr.length)}${statsStr}`);
+          renderState.currentPhase = "idle";
+          renderCompactView();
+        } else {
+          const changes = item.changes || [];
+          for (const c of changes) {
+            const path = c.path || c.file || "";
+            if (path) renderWrite(`  ${ANSI.green}+${ANSI.reset} ${truncateMiddle(path, getPaneWidth() - 6)}\n`);
+          }
         }
       }
       break;
@@ -382,19 +636,32 @@ function renderNotificationANSI(method, params) {
     // ── 계획 업데이트 ──
     case "turn/plan/updated": {
       endStreamMode();
-      renderLabel("plan");
-      if (params.explanation) {
-        renderWrite(`${ANSI.dim}${params.explanation}${ANSI.reset}\n`);
-      }
-      const steps = params.plan || [];
-      for (const step of steps) {
-        let marker;
-        switch (step.status) {
-          case "completed": marker = `${ANSI.green}\u2713${ANSI.reset}`; break;
-          case "inProgress": marker = `${ANSI.yellow}>${ANSI.reset}`; break;
-          default: marker = `${ANSI.dim}-${ANSI.reset}`; break;
+      if (compact) {
+        const steps = params.plan || [];
+        const inProgress = steps.find((s) => s.status === "inProgress");
+        const completedCount = steps.filter((s) => s.status === "completed").length;
+        const total = steps.length;
+        const stepDesc = inProgress ? inProgress.step : (params.explanation || "planning");
+        const planPrefix = `plan: step ${completedCount + (inProgress ? 1 : 0)}/${total} - `;
+        addRecentEvent(`${planPrefix}${truncateMiddle(stepDesc, getPaneWidth() - 10 - planPrefix.length)}`);
+        renderState.currentPhase = "plan";
+        renderCompactView();
+      } else {
+        renderLabel("[PLAN] plan", ANSI.magenta);
+        if (params.explanation) {
+          renderWrite(`${ANSI.dim}${truncateMiddle(params.explanation, getPaneWidth() - 4)}${ANSI.reset}\n`);
         }
-        renderWrite(`  ${marker} ${step.step}\n`);
+        const steps = params.plan || [];
+        const stepW = getPaneWidth() - 6;
+        for (const step of steps) {
+          let marker;
+          switch (step.status) {
+            case "completed": marker = `${ANSI.green}\u2713${ANSI.reset}`; break;
+            case "inProgress": marker = `${ANSI.yellow}>${ANSI.reset}`; break;
+            default: marker = `${ANSI.dim}-${ANSI.reset}`; break;
+          }
+          renderWrite(`  ${marker} ${truncateMiddle(step.step, stepW)}\n`);
+        }
       }
       break;
     }
@@ -402,22 +669,38 @@ function renderNotificationANSI(method, params) {
     // ── Diff 업데이트 ──
     case "turn/diff/updated": {
       endStreamMode();
-      renderLabel("diff");
-      const diff = params.diff || "";
-      const lines = diff.split("\n");
-      for (const line of lines.slice(0, 50)) {
-        if (line.startsWith("+")) {
-          renderWrite(`${ANSI.green}${line}${ANSI.reset}\n`);
-        } else if (line.startsWith("-")) {
-          renderWrite(`${ANSI.red}${line}${ANSI.reset}\n`);
-        } else if (line.startsWith("@@")) {
-          renderWrite(`${ANSI.cyan}${line}${ANSI.reset}\n`);
-        } else {
-          renderWrite(`${line}\n`);
+      if (compact) {
+        const diff = params.diff || "";
+        const lines = diff.split("\n");
+        let addCount = 0, delCount = 0;
+        const filesSet = new Set();
+        for (const line of lines) {
+          if (line.startsWith("+") && !line.startsWith("+++")) addCount++;
+          else if (line.startsWith("-") && !line.startsWith("---")) delCount++;
+          if (line.startsWith("--- a/") || line.startsWith("+++ b/")) {
+            filesSet.add(basename(line.slice(6)));
+          }
         }
-      }
-      if (lines.length > 50) {
-        renderWrite(`${ANSI.dim}... (${lines.length - 50} more lines)${ANSI.reset}\n`);
+        addRecentEvent(`diff: +${addCount}/-${delCount}, ${filesSet.size || "?"} files`);
+        renderCompactView();
+      } else {
+        renderLabel("[PATCH] diff", ANSI.cyan);
+        const diff = params.diff || "";
+        const lines = diff.split("\n");
+        for (const line of lines.slice(0, 50)) {
+          if (line.startsWith("+")) {
+            renderWrite(`${ANSI.green}${line}${ANSI.reset}\n`);
+          } else if (line.startsWith("-")) {
+            renderWrite(`${ANSI.red}${line}${ANSI.reset}\n`);
+          } else if (line.startsWith("@@")) {
+            renderWrite(`${ANSI.cyan}${line}${ANSI.reset}\n`);
+          } else {
+            renderWrite(`${line}\n`);
+          }
+        }
+        if (lines.length > 50) {
+          renderWrite(`${ANSI.dim}... (${lines.length - 50} more lines)${ANSI.reset}\n`);
+        }
       }
       break;
     }
@@ -431,13 +714,17 @@ function renderNotificationANSI(method, params) {
       break;
     }
 
-    // ── 에러 ──
+    // ── 에러 (always show in full) ──
     case "error": {
       endStreamMode();
       const err = params.error;
       const willRetry = params.willRetry ? " (will retry)" : "";
-      renderWrite(`${ANSI.red}${ANSI.bold}error${ANSI.reset}\n`);
-      renderWrite(`${err?.message || JSON.stringify(err)}${willRetry}\n`);
+      renderWrite(`${ANSI.red}${ANSI.bold}[ERR] error${ANSI.reset}\n`);
+      renderWrite(`${truncateMiddle(err?.message || JSON.stringify(err), getPaneWidth() - 4)}${willRetry}\n`);
+      if (compact) {
+        addRecentEvent(`[ERR] ${truncateMiddle(err?.message || "unknown", getPaneWidth() - 12)}`);
+        renderCompactView();
+      }
       break;
     }
 
@@ -597,17 +884,17 @@ function spawnTuiTmuxPane(agentName) {
   const paneId = (splitResult.stdout || "").trim();
   log("TUI", `tmux pane created: ${paneId}`);
 
-  // bridge pane을 백그라운드 윈도우로 숨기고 Ink pane만 보이게
+  // #3 근본 수정: break-pane 제거 — bridge와 viewer를 같은 윈도우에 유지
+  // 이유: break-pane하면 viewer가 죽을 때 윈도우 pane이 0개 → tmux 윈도우 자동 삭제
+  //       → bridge는 숨은 백그라운드 윈도우에서 돌지만 사용자에겐 "꺼짐"으로 보임
+  // viewer pane에 포커스만 이동, bridge pane은 같은 윈도우에 split으로 유지
   try {
-    // Ink pane에 포커스 → bridge pane을 break-pane으로 숨김
     spawnSync("tmux", ["select-pane", "-t", paneId], { stdio: "ignore", timeout: 2000 });
-    spawnSync("tmux", ["break-pane", "-d", "-s", process.env.TMUX_PANE], { stdio: "ignore", timeout: 2000 });
-    // 리더 pane으로 포커스 복원 (원래 있던 곳)
+  } catch {}
+  // 리더(team-lead) pane으로 포커스 복원
+  try {
     spawnSync("tmux", ["select-pane", "-l"], { stdio: "ignore", timeout: 2000 });
-  } catch {
-    // fallback: break-pane 실패하면 그냥 포커스만 복원
-    try { spawnSync("tmux", ["select-pane", "-l"], { stdio: "ignore", timeout: 2000 }); } catch {}
-  }
+  } catch {}
 
   // FIFO를 O_RDWR로 열기 (blocking 방지 Unix 트릭)
   let fd;
@@ -685,34 +972,31 @@ async function readInbox(inboxPath) {
   }
 }
 
-async function readUnreadMessages(inboxPath) {
+// ─── Claim + MarkAsRead 통합: 1회 lock/parse/write ───
+async function claimUnreadMessages(inboxPath) {
   return withLock(inboxPath, async () => {
     const messages = await readInbox(inboxPath);
     const unread = [];
+    let changed = false;
     for (let i = 0; i < messages.length; i++) {
       if (!messages[i].read) {
-        unread.push({ index: i, msg: messages[i] });
+        unread.push({ msg: messages[i] });
+        messages[i].read = true;
+        changed = true;
       }
     }
+    if (changed) {
+      const readMessages = messages.filter((m) => m.read);
+      let pruned = messages;
+      if (readMessages.length > 100) {
+        const unreadMsgs = messages.filter((m) => !m.read);
+        const recentRead = readMessages.slice(-50);
+        pruned = [...recentRead, ...unreadMsgs];
+        log("INBOX-PRUNE", `pruned ${messages.length} → ${pruned.length} messages`);
+      }
+      await writeFile(inboxPath, JSON.stringify(pruned), "utf-8");
+    }
     return unread;
-  });
-}
-
-async function markAsRead(inboxPath, indices) {
-  await withLock(inboxPath, async () => {
-    const messages = await readInbox(inboxPath);
-    for (const idx of indices) {
-      if (messages[idx]) messages[idx].read = true;
-    }
-    const readMessages = messages.filter((m) => m.read);
-    let pruned = messages;
-    if (readMessages.length > 100) {
-      const unread = messages.filter((m) => !m.read);
-      const recentRead = readMessages.slice(-50);
-      pruned = [...recentRead, ...unread];
-      log("INBOX-PRUNE", `pruned ${messages.length} → ${pruned.length} messages`);
-    }
-    await writeFile(inboxPath, JSON.stringify(pruned, null, 2), "utf-8");
   });
 }
 
@@ -721,8 +1005,85 @@ async function writeToInbox(inboxPath, message) {
   await withLock(inboxPath, async () => {
     const messages = await readInbox(inboxPath);
     messages.push(message);
-    await writeFile(inboxPath, JSON.stringify(messages, null, 2), "utf-8");
+    await writeFile(inboxPath, JSON.stringify(messages), "utf-8");
   });
+}
+
+// ─── Leader Outbox (CAS + micro-batching + in-memory spool) ───
+// 1) CAS+temp rename: lock 보유 시간 최소화
+// 2) micro-batching: 50ms debounce로 여러 메시지를 1회 write
+// 3) in-memory spool: 워커별 큐 → flush 시에만 leader inbox에 쓰기
+class LeaderOutbox {
+  constructor(leaderInboxPath) {
+    this.path = leaderInboxPath;
+    this.queue = [];
+    this.timer = null;
+    this.chain = Promise.resolve();
+  }
+
+  enqueue(msg) {
+    this.queue.push(msg);
+    if (!this.timer) {
+      this.timer = setTimeout(() => {
+        this.timer = null;
+        this.chain = this.chain
+          .then(() => this._drain())
+          .catch((e) => log("OUTBOX-ERR", e.message));
+      }, FLUSH_DEBOUNCE_MS);
+    }
+  }
+
+  flush() {
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    this.chain = this.chain
+      .then(() => this._drain())
+      .catch((e) => log("OUTBOX-ERR", e.message));
+    return this.chain;
+  }
+
+  async _drain() {
+    if (this.queue.length === 0) return;
+    const batch = this.queue.splice(0);
+    await ensureInbox(this.path);
+
+    // Phase 1: prepare outside lock (heavy I/O)
+    const pre = await fsStat(this.path).catch(() => null);
+    const existing = await readInbox(this.path);
+    existing.push(...batch);
+    const tmp = `${this.path}.tmp.${process.pid}`;
+    await writeFile(tmp, JSON.stringify(existing), "utf-8");
+
+    // Phase 2: CAS verify + atomic rename inside lock (minimal hold)
+    let ok = false;
+    try {
+      ok = await withLock(this.path, async () => {
+        const post = await fsStat(this.path).catch(() => null);
+        if (pre && post && pre.mtimeMs !== post.mtimeMs) return false;
+        await rename(tmp, this.path);
+        return true;
+      });
+    } catch (e) {
+      try { unlinkSync(tmp); } catch {}
+      throw e;
+    }
+
+    // CAS 실패: 다른 워커가 변경 → fallback (전통적 lock+rewrite)
+    if (!ok) {
+      try { unlinkSync(tmp); } catch {}
+      log("CAS-RETRY", `mtime changed, fallback to full lock`);
+      await withLock(this.path, async () => {
+        const msgs = await readInbox(this.path);
+        msgs.push(...batch);
+        await writeFile(this.path, JSON.stringify(msgs), "utf-8");
+      });
+    }
+
+    // 로깅은 sendToLeader/sendIdleNotification에서 이미 수행
+  }
+
+  destroy() {
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+  }
 }
 
 // ─── Message Helpers ───
@@ -774,24 +1135,75 @@ function makeShutdownApproved(agentName, requestId) {
   };
 }
 
+// ─── tmux pane title 상태 업데이트 ───
+function updatePaneTitle(agentName, status) {
+  if (!process.env.TMUX) return;
+  try {
+    spawnSync("tmux", ["select-pane", "-T", `${agentName} [${status}]`], { stdio: "ignore", timeout: 1000 });
+  } catch {}
+}
+
+// ─── tmux border-status 설정 (pane 상단에 타이틀 표시) ───
+function setupPaneBorderStatus(paneId) {
+  if (!paneId && !process.env.TMUX) return;
+  try {
+    const target = paneId ? ["-t", paneId] : [];
+    spawnSync("tmux", ["set-option", "-p", ...target, "pane-border-status", "top"], { stdio: "ignore", timeout: 1000 });
+    spawnSync("tmux", ["set-option", "-p", ...target, "pane-border-format", "#{pane_title}"], { stdio: "ignore", timeout: 1000 });
+  } catch {}
+}
+
+// ─── tmux border-status 헤더 업데이트 (throttled) ───
+let _lastBorderUpdateAt = 0;
+const BORDER_UPDATE_THROTTLE_MS = 500;
+
+function updateBorderStatus(agentName, config) {
+  if (!process.env.TMUX) return;
+  const now = Date.now();
+  if (now - _lastBorderUpdateAt < BORDER_UPDATE_THROTTLE_MS) return;
+  _lastBorderUpdateAt = now;
+
+  const phase = renderState.currentPhase || "idle";
+  const phaseTag = PHASE_LABELS[phase] || phase.toUpperCase();
+
+  const elapsed = renderState.turnStartedAt > 0
+    ? formatElapsed(Date.now() - renderState.turnStartedAt)
+    : "";
+
+  const parts = [`${agentName} [${phaseTag}]`];
+  if (elapsed) parts.push(elapsed);
+  if (renderState.suppressedLines > 0) parts.push(`${renderState.suppressedLines} hidden`);
+
+  const title = truncateMiddle(parts.join(" | "), 60);
+  try {
+    spawnSync("tmux", ["select-pane", "-T", title], { stdio: "ignore", timeout: 1000 });
+  } catch {}
+}
+
 // ─── Leader Communication ───
 async function sendToLeader(config, text, summary) {
-  const leaderInbox = getLeaderInboxPath(config.teamName);
   const msg = makeMessage(config.agentName, text, config.agentColor, summary);
-  await writeToInbox(leaderInbox, msg);
+  if (leaderOutbox) {
+    leaderOutbox.enqueue(msg);
+  } else {
+    const leaderInbox = getLeaderInboxPath(config.teamName);
+    await writeToInbox(leaderInbox, msg);
+  }
   log("SENT", summary || text.slice(0, 60));
 }
 
 async function sendToLeaderWithRetry(config, text, summary) {
   try {
     await sendToLeader(config, text, summary);
+    if (leaderOutbox) await leaderOutbox.flush();
   } catch (err1) {
     log("SEND-RETRY", `first attempt failed: ${err1.message}, retrying...`);
     try {
       await sleep(500);
       await sendToLeader(config, text, summary);
+      if (leaderOutbox) await leaderOutbox.flush();
     } catch (err2) {
-      log("SEND-FAIL", `result delivery failed permanently: ${err2.message}`);
+      logAndRenderError("SEND-FAIL", `result delivery failed permanently: ${err2.message}`);
     }
   }
 }
@@ -810,7 +1222,6 @@ async function sendIdleNotification(config, opts = {}) {
     lastIdleSentAt = Date.now();
   }
 
-  const leaderInbox = getLeaderInboxPath(config.teamName);
   const notification = makeIdleNotification(config.agentName, opts);
   const msg = makeMessage(
     config.agentName,
@@ -818,12 +1229,21 @@ async function sendIdleNotification(config, opts = {}) {
     config.agentColor,
     opts.summary || "Codex worker idle"
   );
-  await writeToInbox(leaderInbox, msg);
+  if (leaderOutbox) {
+    leaderOutbox.enqueue(msg);
+    if (isStateChange) await leaderOutbox.flush();
+  } else {
+    const leaderInbox = getLeaderInboxPath(config.teamName);
+    await writeToInbox(leaderInbox, msg);
+  }
   log("IDLE", opts.summary || "waiting for next task");
+  updatePaneTitle(config.agentName, "idle");
+  updateBorderStatus(config.agentName);
 }
 
 async function handleShutdown(config, request) {
   log("SHUTDOWN", `reason: ${request.reason || "none"}`);
+  shuttingDown = true; // #2 수정: 시그널 핸들러 재진입 방지
   const response = makeShutdownApproved(config.agentName, request.requestId);
   const leaderInbox = getLeaderInboxPath(config.teamName);
   const msg = makeMessage(
@@ -832,7 +1252,12 @@ async function handleShutdown(config, request) {
     config.agentColor,
     "Shutdown approved"
   );
-  await writeToInbox(leaderInbox, msg);
+  if (leaderOutbox) {
+    leaderOutbox.enqueue(msg);
+    await leaderOutbox.flush();
+  } else {
+    await writeToInbox(leaderInbox, msg);
+  }
   running = false;
   closeViewer();
 
@@ -876,10 +1301,11 @@ import { readdirSync } from "node:fs";
 
 async function markMyTasksCompleted(config) {
   const taskDir = join(TASKS_BASE, sanitize(config.teamName));
-  if (!existsSync(taskDir)) return;
+  if (!existsSync(taskDir)) return { completedTaskId: null, success: false };
 
   try {
     const files = readdirSync(taskDir).filter((f) => f.endsWith(".json"));
+    let completedTaskId = null;
     for (const f of files) {
       const fp = join(taskDir, f);
       try {
@@ -888,12 +1314,15 @@ async function markMyTasksCompleted(config) {
         if (task.owner === config.agentName && task.status === "in_progress") {
           task.status = "completed";
           await writeFile(fp, JSON.stringify(task, null, 2), "utf-8");
-          log("TASK-DONE", `marked task ${task.id || f} as completed`);
+          completedTaskId = task.id || f;
+          log("TASK-DONE", `marked task ${completedTaskId} as completed`);
         }
       } catch { /* skip invalid files */ }
     }
+    return { completedTaskId, success: completedTaskId !== null };
   } catch (err) {
     log("TASK-ERR", err.message);
+    return { completedTaskId: null, success: false };
   }
 }
 
@@ -954,6 +1383,9 @@ class AppServerSession {
     this.stdoutBuffer = "";
     this.startPromise = null;
     this.closed = false;
+    // lifecycle 콜백
+    this.onStatus = opts.onStatus || null;
+    this.onError = opts.onError || null;
   }
 
   async ensureStarted() {
@@ -988,7 +1420,10 @@ class AppServerSession {
     child.stdout.on("data", (chunk) => this.handleStdout(chunk));
     child.stderr.on("data", (chunk) => {
       const text = String(chunk).trim();
-      if (text) log("APP-SERVER", text);
+      if (text) {
+        log("APP-SERVER", text);
+        this.onError?.("APP-SERVER", text);
+      }
     });
     child.on("close", (code, signal) => this.handleClose(code, signal));
     child.on("error", (err) => this.handleFatal(err));
@@ -1025,9 +1460,11 @@ class AppServerSession {
         reasoningEffort: started?.reasoningEffort || started?.reasoning_effort || null,
       };
       log("SESSION", `real info: model=${sessionInfo.model} provider=${sessionInfo.modelProvider} ua=${sessionInfo.userAgent}`);
+      this.onStatus?.("session ready");
     } catch (err) {
       if (this.child === child) {
         log("STARTUP-FAIL", `cleaning up child (pid=${child.pid}): ${err.message}`);
+        this.onError?.("STARTUP-FAIL", err.message);
         child.kill("SIGTERM");
         this.child = null;
         currentChild = null;
@@ -1192,6 +1629,7 @@ class AppServerSession {
         }
       }
       this.acceptTurnStarted = false;
+      this.onStatus?.("turn started");
       return;
     }
 
@@ -1411,14 +1849,68 @@ class AppServerSession {
 async function pollLoop(config) {
   const myInbox = getInboxPath(config.agentName, config.teamName);
   await ensureInbox(myInbox);
-  lastInboxMtime = 0;
   currentPollMs = POLL_INTERVAL_MS;
+
+  // ─── Leader Outbox 초기화 ───
+  leaderOutbox = new LeaderOutbox(getLeaderInboxPath(config.teamName));
+
+  // lifecycle 상태 이벤트: 리더에게 중간 진행 보고
+  let lastStatusSentAt = 0;
+  const STATUS_COOLDOWN_MS = 3000;
+  function emitStatus(status) {
+    const now = Date.now();
+    if (now - lastStatusSentAt < STATUS_COOLDOWN_MS) return;
+    lastStatusSentAt = now;
+    sendToLeader(config, `[STATUS] ${status}`, status).catch(() => {});
+    updateBorderStatus(config.agentName);
+  }
+
   const session = new AppServerSession({
     cwd: process.cwd(),
     effort: codexEffort,
+    onStatus: (status) => emitStatus(status),
+    onError: (tag, msg) => {
+      logAndRenderError(tag, msg);
+      sendToLeader(config, `[ERROR] [${tag}] ${msg}`, `Error: ${tag}`).catch(() => {});
+    },
   });
 
   log("POLL", `inbox: ${myInbox}`);
+
+  // ─── fs.watch 기반 inbox 감시 (polling fallback 겸용) ───
+  const inboxDir = join(myInbox, "..");
+  const inboxBasename = basename(myInbox);
+  let watchResolve = null;
+  let fsWatcher = null;
+  try {
+    fsWatcher = fsWatch(inboxDir, { persistent: false }, (eventType, filename) => {
+      // 내 inbox 파일 변경에만 반응 (thundering herd 방지)
+      if (filename && filename !== inboxBasename) return;
+      if (watchResolve) {
+        const r = watchResolve;
+        watchResolve = null;
+        r();
+      }
+    });
+    fsWatcher.on("error", (err) => {
+      logAndRenderError("WATCH-ERR", `${err.message}, falling back to polling`);
+      sendToLeader(config, `[ERROR] [WATCH-ERR] ${err.message}`, "Watch error").catch(() => {});
+      try { fsWatcher.close(); } catch {}
+      fsWatcher = null;
+    });
+    log("WATCH", `fs.watch active on ${inboxDir}`);
+  } catch (err) {
+    log("WATCH-FALLBACK", `fs.watch unavailable: ${err.message}`);
+  }
+
+  function waitForInboxChange(timeoutMs) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, timeoutMs);
+      if (fsWatcher) {
+        watchResolve = () => { clearTimeout(timer); resolve(); };
+      }
+    });
+  }
 
   // 활성 턴의 완료를 추적하는 promise (null = 유휴 상태)
   let activeTurnPromise = null;
@@ -1429,9 +1921,33 @@ async function pollLoop(config) {
   function enqueuePendingSteer(text) {
     if (pendingSteerQueue.length >= MAX_PENDING_STEERS) {
       const dropped = pendingSteerQueue.shift();
-      log("STEER-DROP", `queue full (${MAX_PENDING_STEERS}), dropped oldest (len=${dropped.length})`);
+      logAndRenderError("STEER-DROP", `queue full (${MAX_PENDING_STEERS}), dropped oldest (len=${dropped.length})`);
     }
     pendingSteerQueue.push(text);
+  }
+
+  // 메시지 중복 처리 방지 (content hash 기반)
+  const DEDUP_MAX = 20;
+  const recentMessageHashes = new Set();
+  const recentMessageOrder = []; // FIFO로 오래된 항목 제거
+  function makeMessageHash(msg) {
+    // from + text 앞부분으로 경량 해시 생성
+    const key = `${msg.from}|${msg.text.slice(0, 512)}`;
+    let h = 0;
+    for (let i = 0; i < key.length; i++) {
+      h = ((h << 5) - h + key.charCodeAt(i)) | 0;
+    }
+    return h.toString(36);
+  }
+  function isDuplicateMessage(msg) {
+    const hash = makeMessageHash(msg);
+    if (recentMessageHashes.has(hash)) return true;
+    recentMessageHashes.add(hash);
+    recentMessageOrder.push(hash);
+    while (recentMessageOrder.length > DEDUP_MAX) {
+      recentMessageHashes.delete(recentMessageOrder.shift());
+    }
+    return false;
   }
 
   // 턴 완료 핸들러: 결과를 리더에게 전송
@@ -1453,28 +1969,51 @@ async function pollLoop(config) {
       return;
     }
 
+    updatePaneTitle(config.agentName, result.success ? "done" : "error");
+    updateBorderStatus(config.agentName);
+
+    // 결과 summary에 첫 줄 키워드 포함 (구분 용이)
+    const summaryHint = result.output
+      ? result.output.split("\n").find((l) => l.trim())?.slice(0, 60) || ""
+      : "";
+
     if (result.success) {
       // 2단계 저장: 전체 → 파일, 미리보기 → inbox
       const filePath = await saveResultFile(config, result.output).catch((e) => {
-        log("SAVE-ERR", `result file save failed: ${e.message}`);
+        logAndRenderError("SAVE-ERR", `result file save failed: ${e.message}`);
         return null;
       });
       const msg = filePath
         ? makePreview(result.output, filePath)
         : result.output;
-      void sendToLeaderWithRetry(config, msg, "Codex task completed");
-      markMyTasksCompleted(config).catch(() => {});
-      sendIdleNotification(config, {
-        summary: "Task completed, ready for next",
-        completedStatus: "completed",
-      }).catch(() => {});
+      const summary = summaryHint ? `Done: ${summaryHint}` : "Codex task completed";
+      // await로 결과 전송 완료 후 idle 전송 (순서 보장)
+      await sendToLeaderWithRetry(config, msg, summary);
+      if (shutdownRequested) return;
+      // 태스크 완료를 먼저 마킹한 후 idle 전송 (순서 보장으로 재스케줄링 방지)
+      const taskResult = await markMyTasksCompleted(config);
+      if (shutdownRequested) return;
+      if (taskResult.success) {
+        sendIdleNotification(config, {
+          summary: "Task completed, ready for next",
+          completedStatus: "completed",
+        }).catch(() => {});
+      } else {
+        sendIdleNotification(config, {
+          summary: "Task completed, ready for next",
+          completedStatus: "available",
+        }).catch(() => {});
+      }
     } else {
       const fullErr = `[ERROR] Codex failed:\n${result.output}`;
       const filePath = await saveResultFile(config, fullErr).catch(() => null);
       const errMsg = filePath
         ? makePreview(fullErr, filePath)
         : fullErr;
-      void sendToLeaderWithRetry(config, errMsg, "Codex task failed");
+      const summary = summaryHint ? `Failed: ${summaryHint}` : "Codex task failed";
+      // await로 결과 전송 완료 후 idle 전송 (순서 보장)
+      await sendToLeaderWithRetry(config, errMsg, summary);
+      if (shutdownRequested) return;
       sendIdleNotification(config, {
         idleReason: "error",
         summary: "Task failed",
@@ -1486,7 +2025,7 @@ async function pollLoop(config) {
   async function handleTurnError(err) {
     activeTurnPromise = null;
     steerChain = Promise.resolve();
-    if (!running) return;
+    if (!running || shutdownRequested) return;
 
     if (pendingSteerQueue.length > 0) {
       const queued = pendingSteerQueue.splice(0);
@@ -1501,12 +2040,17 @@ async function pollLoop(config) {
       return;
     }
 
+    updatePaneTitle(config.agentName, "error");
+    updateBorderStatus(config.agentName);
+
     const fullErr = `[ERROR] Codex app-server error: ${err.message}`;
     const filePath = await saveResultFile(config, fullErr).catch(() => null);
     const errMsg = filePath
       ? makePreview(fullErr, filePath)
       : fullErr;
-    void sendToLeaderWithRetry(config, errMsg, "Codex task failed");
+    const errSummary = `Failed: ${err.message.slice(0, 50)}`;
+    await sendToLeaderWithRetry(config, errMsg, errSummary);
+    if (shutdownRequested) return;
     sendIdleNotification(config, {
       idleReason: "error",
       summary: "Task failed",
@@ -1516,121 +2060,143 @@ async function pollLoop(config) {
 
   try {
     while (running) {
-      const st = await fsStat(myInbox).catch(() => null);
+      const unread = await claimUnreadMessages(myInbox);
       let sawMessages = false;
-      if (st && st.mtimeMs !== lastInboxMtime) {
-        lastInboxMtime = st.mtimeMs;
-        const unread = await readUnreadMessages(myInbox);
 
-        if (unread.length > 0) {
-          sawMessages = true;
-          currentPollMs = POLL_ACTIVE_MS;
-          const processedIndices = [];
+      if (unread.length > 0) {
+        sawMessages = true;
+        currentPollMs = POLL_ACTIVE_MS;
 
-          for (const { index, msg } of unread) {
-            if (!running) break;
+        for (const { msg } of unread) {
+          if (!running) break;
 
-            const protocol = tryParseProtocol(msg.text);
+          const protocol = tryParseProtocol(msg.text);
 
-            // shutdown_request 처리: 활성 턴 완료 대기 후 승인
-            if (protocol?.type === "shutdown_request") {
-              if (activeTurnPromise) {
-                log("SHUTDOWN", "waiting for active turn to complete (max 15s)...");
-                const race = await Promise.race([
-                  activeTurnPromise.then(() => "done"),
-                  sleep(15000).then(() => "timeout"),
-                ]).catch(() => "error");
-                if (race === "timeout") {
-                  log("SHUTDOWN", "timeout — interrupting active turn");
-                  await session.interruptActiveTurn().catch(() => {});
-                  await sleep(2000);
-                }
-              }
-              processedIndices.push(index);
-              await markAsRead(myInbox, processedIndices);
-              await handleShutdown(config, protocol);
-              return;
-            }
-
-            // 프로토콜 메시지 스킵
-            if (protocol?.type === "permission_request") {
-              log("SKIP", "permission_request (Codex uses own sandbox)");
-              processedIndices.push(index);
-              continue;
-            }
-            if (protocol?.type === "mode_set_request") {
-              log("SKIP", `mode_set_request: ${protocol.mode}`);
-              processedIndices.push(index);
-              continue;
-            }
-            if (protocol?.type === "idle_notification") {
-              log("SKIP", "idle_notification from leader");
-              processedIndices.push(index);
-              continue;
-            }
-
-            const taskText = msg.text;
-
-            // ★ Phase 2 핵심: 활성 턴이 있으면 steer, 없으면 새 턴
+          // shutdown_request 처리: 즉시 플래그 설정 후 활성 턴 완료 대기
+          if (protocol?.type === "shutdown_request") {
+            running = false;
+            shutdownRequested = true;
+            pendingSteerQueue.length = 0;
             if (activeTurnPromise) {
-              if (session.currentTurn) {
-                // 양방향: 실행 중인 Codex에 실시간 메시지 주입
-                log("STEER", `injecting mid-turn message, len=${taskText.length}`);
-                // steer는 직렬화: 이전 steer 완료 후 다음 steer 전송
-                steerChain = steerChain.then(async () => {
-                  if (!session.currentTurn) {
-                    enqueuePendingSteer(taskText);
-                    log("STEER-DEFERRED", `turn ended, queued for next turn (${pendingSteerQueue.length} pending)`);
-                    return;
-                  }
-                  try {
-                    await session.runTurn(taskText);
-                  } catch (steerErr) {
-                    log("STEER-ERR", steerErr.message);
-                    // steer 실패 시 pendingSteerQueue에 보관 → 다음 턴에서 처리
-                    enqueuePendingSteer(taskText);
-                    log("STEER-QUEUED", `queued for next turn (${pendingSteerQueue.length} pending)`);
-                  }
-                }).catch(() => {});
-              } else {
-                log("STEER-STARTING", `turn starting, queuing message (len=${taskText.length})`);
-                enqueuePendingSteer(taskText);
-              }
-            } else {
-              // 유휴 상태: 새 턴 시작 (비동기 — 블로킹하지 않음!)
-              // pendingSteerQueue에 실패한 steer가 있으면 본문에 포함
-              let fullPrompt = taskText;
-              if (pendingSteerQueue.length > 0) {
-                const queued = pendingSteerQueue.splice(0);
-                log("STEER-DRAIN", `draining ${queued.length} queued steer messages into new turn`);
-                fullPrompt = [taskText, ...queued].join("\n\n---\n\n");
-              }
-              log("TASK", `from=${msg.from}, len=${fullPrompt.length}`);
-              try {
-                activeTurnPromise = session.runTurn(fullPrompt);
-                activeTurnPromise.then(handleTurnResult, handleTurnError);
-              } catch (err) {
-                handleTurnError(err);
+              log("SHUTDOWN", "waiting for active turn to complete (max 5s)...");
+              const race = await Promise.race([
+                activeTurnPromise.then(() => "done"),
+                sleep(5000).then(() => "timeout"),
+              ]).catch(() => "error");
+              if (race === "timeout") {
+                log("SHUTDOWN", "timeout — interrupting active turn");
+                // #4 수정: interrupt도 5초 제한 (기존 RPC 30초 대기 방지)
+                await Promise.race([
+                  session.interruptActiveTurn(),
+                  sleep(5000),
+                ]).catch(() => {});
+                await sleep(500);
               }
             }
-
-            processedIndices.push(index);
+            await handleShutdown(config, protocol);
+            return;
           }
 
-          if (processedIndices.length > 0) {
-            await markAsRead(myInbox, processedIndices);
+          // 프로토콜 메시지 스킵
+          if (protocol?.type === "permission_request") {
+            log("SKIP", "permission_request (Codex uses own sandbox)");
+            continue;
+          }
+          if (protocol?.type === "mode_set_request") {
+            log("SKIP", `mode_set_request: ${protocol.mode}`);
+            continue;
+          }
+          if (protocol?.type === "idle_notification") {
+            log("SKIP", "idle_notification from leader");
+            continue;
+          }
+
+          // 메시지 중복 처리 방지 (동일 메시지 재전송 감지)
+          if (isDuplicateMessage(msg)) {
+            log("DEDUP", `skipping duplicate message from=${msg.from}, len=${msg.text.length}`);
+            continue;
+          }
+
+          const taskText = msg.text;
+
+          // ★ Phase 2 핵심: 활성 턴이 있으면 steer, 없으면 새 턴
+          if (activeTurnPromise) {
+            if (session.currentTurn) {
+              // 양방향: 실행 중인 Codex에 실시간 메시지 주입
+              log("STEER", `injecting mid-turn message, len=${taskText.length}`);
+              // steer는 직렬화: 이전 steer 완료 후 다음 steer 전송
+              steerChain = steerChain.then(async () => {
+                if (!session.currentTurn) {
+                  enqueuePendingSteer(taskText);
+                  log("STEER-DEFERRED", `turn ended, queued for next turn (${pendingSteerQueue.length} pending)`);
+                  return;
+                }
+                try {
+                  await session.runTurn(taskText);
+                } catch (steerErr) {
+                  logAndRenderError("STEER-ERR", steerErr.message);
+                  // steer 실패 시 pendingSteerQueue에 보관 → 다음 턴에서 처리
+                  enqueuePendingSteer(taskText);
+                  logAndRender("STEER-QUEUED", `queued for next turn (${pendingSteerQueue.length} pending)`);
+                }
+              }).catch(() => {});
+            } else {
+              log("STEER-STARTING", `turn starting, queuing message (len=${taskText.length})`);
+              enqueuePendingSteer(taskText);
+            }
+          } else {
+            // 유휴 상태: 새 턴 시작 (비동기 — 블로킹하지 않음!)
+            // pendingSteerQueue에 실패한 steer가 있으면 본문에 포함
+            let fullPrompt = taskText;
+            if (pendingSteerQueue.length > 0) {
+              const queued = pendingSteerQueue.splice(0);
+              log("STEER-DRAIN", `draining ${queued.length} queued steer messages into new turn`);
+              fullPrompt = [taskText, ...queued].join("\n\n---\n\n");
+            }
+            log("TASK", `from=${msg.from}, len=${fullPrompt.length}`);
+            // 리더에게 작업 수락 ack 전송 (비동기, 블로킹 안 함)
+            const coldStart = !session.threadId;
+            const ackMsg = coldStart
+              ? `[STATUS] task accepted, starting codex app-server...`
+              : `[STATUS] task accepted (len=${fullPrompt.length})`;
+            sendToLeader(config, ackMsg, coldStart ? "Cold start..." : "Task accepted").catch(() => {});
+            updatePaneTitle(config.agentName, coldStart ? "starting" : "busy");
+            updateBorderStatus(config.agentName);
+            try {
+              activeTurnPromise = session.runTurn(fullPrompt);
+              activeTurnPromise.then(handleTurnResult, handleTurnError);
+            } catch (err) {
+              handleTurnError(err);
+            }
           }
         }
       }
 
       if (running) {
-        if (!sawMessages) {
-          currentPollMs = Math.min(currentPollMs * 2, POLL_IDLE_MS);
+        if (fsWatcher) {
+          // fs.watch: 이벤트 대기 + fallback timeout
+          await waitForInboxChange(sawMessages ? POLL_ACTIVE_MS : POLL_FALLBACK_MS);
+        } else {
+          // fallback: adaptive polling (기존 동작)
+          if (!sawMessages) {
+            currentPollMs = Math.min(currentPollMs * 2, POLL_IDLE_MS);
+          }
+          await sleep(currentPollMs);
         }
-        await sleep(currentPollMs);
       }
     }
   } finally {
+    // fs.watch 정리
+    if (fsWatcher) {
+      try { fsWatcher.close(); } catch {}
+      fsWatcher = null;
+    }
+    // outbox flush + 정리
+    if (leaderOutbox) {
+      await leaderOutbox.flush().catch(() => {});
+      leaderOutbox.destroy();
+      leaderOutbox = null;
+    }
     // 활성 턴이 있으면 완료를 잠시 기다려본다
     if (activeTurnPromise) {
       await Promise.race([activeTurnPromise, sleep(2000)]).catch(() => {});
@@ -1645,10 +2211,27 @@ let shuttingDown = false;
 function setupSignalHandlers(config) {
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
     process.on(sig, async () => {
-      if (shuttingDown) return;
+      if (shuttingDown) {
+        // #2 수정: 이미 종료 중이면 즉시 강제 종료
+        log("SIGNAL", `${sig} received during shutdown — force exit`);
+        closeViewer();
+        closeLogFile();
+        killMyPane();
+        process.exit(1);
+        return;
+      }
       shuttingDown = true;
       log("SIGNAL", sig);
       running = false;
+      // #2 수정: 5초 내 종료 못 하면 강제 종료
+      const forceTimer = setTimeout(() => {
+        log("SIGNAL", "force exit after 5s timeout");
+        closeViewer();
+        closeLogFile();
+        killMyPane();
+        process.exit(1);
+      }, 5000);
+      forceTimer.unref();
       if (currentChild) {
         currentChild.kill("SIGTERM");
       }
@@ -1740,24 +2323,35 @@ async function main() {
   log("INFO", `cwd=${process.cwd()}`);
   log("INFO", `pid=${process.pid}`);
 
-  // TUI 뷰어 스폰 — tmux 환경이면 자동으로 tmux pane, 아니면 CODEX_BRIDGE_TUI=1일 때 자식 프로세스
-  if (process.env.CODEX_BRIDGE_TUI === "0") {
-    // 명시적 비활성 → ANSI fallback
-    log("TUI", "TUI explicitly disabled, using ANSI fallback");
-  } else if (process.env.TMUX) {
-    // tmux 환경 → tmux pane에 뷰어 (기본 활성)
-    viewerProc = spawnTuiTmuxPane(config.agentName);
-    if (!viewerProc) {
-      log("TUI", "tmux pane spawn failed, falling back to ANSI");
-    }
-  } else if (process.env.CODEX_BRIDGE_TUI === "1") {
-    // tmux 없지만 TUI 명시 → 자식 프로세스 방식
-    viewerProc = spawnTuiViewer(config.agentName);
-  } else {
-    // tmux 없고 TUI 미지정 → ANSI fallback
+  // tmux pane title 설정 (워커명 표시)
+  if (process.env.TMUX) {
     try {
-      spawn("tmux", ["select-pane", "-l"], { stdio: "ignore", detached: true }).unref();
+      spawnSync("tmux", ["select-pane", "-T", `${config.agentName} [idle]`], { stdio: "ignore", timeout: 2000 });
     } catch {}
+    setupPaneBorderStatus(); // pane 상단 border에 타이틀 표시
+  }
+  _borderAgentName = config.agentName;
+
+  // TUI 뷰어: 기본 비활성 (ANSI fallback)
+  // 이유: viewer pane이 워커당 1개 추가 → pane 수 2배, Ink native crash 위험
+  // CODEX_BRIDGE_TUI=1로 명시적 활성화 가능
+  if (process.env.CODEX_BRIDGE_TUI === "1") {
+    if (process.env.TMUX) {
+      viewerProc = spawnTuiTmuxPane(config.agentName);
+      if (!viewerProc) {
+        log("TUI", "tmux pane spawn failed, falling back to ANSI");
+      }
+    } else {
+      viewerProc = spawnTuiViewer(config.agentName);
+    }
+  } else {
+    // ANSI fallback (기본값) — bridge pane에서 직접 렌더링
+    log("TUI", "using ANSI fallback (default)");
+    if (process.env.TMUX) {
+      try {
+        spawn("tmux", ["select-pane", "-l"], { stdio: "ignore", detached: true }).unref();
+      } catch {}
+    }
   }
 
   // ANSI 출력이 stderr로 가므로 항상 로그 파일로 분리
@@ -1776,7 +2370,9 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("[codex-bridge] Fatal:", err);
+  const msg = err?.message || String(err);
+  console.error("[codex-bridge] Fatal:", msg);
+  logAndRenderError("FATAL", msg);
   closeViewer();
   closeLogFile();
   process.exit(1);

@@ -20,6 +20,14 @@ function parseArgs(argv) {
 
 const { name, fifo } = parseArgs(process.argv);
 
+// #3 수정: 글로벌 에러 핸들러 — uncaught exception으로 뷰어가 죽지 않도록
+process.on("uncaughtException", (err) => {
+  process.stderr.write(`[codex-ink-viewer] uncaught: ${err.message}\n${err.stack}\n`);
+});
+process.on("unhandledRejection", (reason) => {
+  process.stderr.write(`[codex-ink-viewer] unhandled rejection: ${reason}\n`);
+});
+
 // ─── Content Block Types ───
 const BLOCK_AGENT = "agent";
 const BLOCK_EXEC = "exec";
@@ -468,25 +476,52 @@ function App({ workerName, fifoPath }) {
 
   // FIFO/stdin 읽기
   useEffect(() => {
-    const inputStream = fifoPath
-      ? createReadStream(fifoPath, { encoding: "utf8" })
-      : process.stdin;
+    let disposed = false;
+    let currentRl = null;
+    let reopenTimer = null;
 
-    const rl = readline.createInterface({ input: inputStream, terminal: false });
+    function openStream() {
+      if (disposed) return;
+      const inputStream = fifoPath
+        ? createReadStream(fifoPath, { encoding: "utf8" })
+        : process.stdin;
 
-    rl.on("line", (line) => {
-      if (!line.trim()) return;
-      try {
-        const { method, params } = JSON.parse(line);
-        handleNotification(method, params);
-      } catch {}
-    });
+      const rl = readline.createInterface({ input: inputStream, terminal: false });
+      currentRl = rl;
 
-    rl.on("close", () => {
-      setTimeout(() => exit(), 500);
-    });
+      rl.on("line", (line) => {
+        if (!line.trim()) return;
+        try {
+          const { method, params } = JSON.parse(line);
+          handleNotification(method, params);
+        } catch {}
+      });
 
-    return () => rl.close();
+      rl.on("close", () => {
+        // #3 수정: FIFO EOF시 바로 종료하지 않고 재연결 시도
+        // createReadStream이 빈 FIFO를 EOF로 해석할 수 있음
+        if (fifoPath && !disposed) {
+          reopenTimer = setTimeout(() => openStream(), 1000);
+        } else {
+          setTimeout(() => exit(), 500);
+        }
+      });
+
+      inputStream.on("error", () => {
+        // FIFO 읽기 에러 시에도 재연결 시도
+        if (fifoPath && !disposed) {
+          reopenTimer = setTimeout(() => openStream(), 1000);
+        }
+      });
+    }
+
+    openStream();
+
+    return () => {
+      disposed = true;
+      if (reopenTimer) clearTimeout(reopenTimer);
+      if (currentRl) currentRl.close();
+    };
   }, [fifoPath, handleNotification, exit]);
 
   const rows = stdout?.rows || 24;
