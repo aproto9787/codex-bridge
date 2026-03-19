@@ -36,10 +36,19 @@ const BASE_INSTRUCTIONS = `\
 - 에러나 문제를 발견하면 숨기지 않고 보고한다.
 
 ## 멀티에이전트 활용
-- 복잡한 태스크는 서브에이전트를 스폰하여 병렬 처리할 수 있다.
+- 복잡한 태스크는 반드시 서브에이전트를 스폰하여 병렬 처리한다.
 - 서브에이전트 활용 기준: 독립적으로 분할 가능한 하위 작업이 2개 이상일 때.
+- 리더가 "서브에이전트로 병렬 처리하라"고 명시한 경우, 하위 작업을 최대한 독립적으로 분할하여 동시 실행한다.
 - 단순 작업(파일 1~2개 수정, 단일 함수 구현 등)은 직접 처리한다.
 - 서브에이전트에게도 동일한 행동 규칙(간결, 범위 준수, 과잉 금지)을 적용한다.
+- 서브에이전트 결과를 통합하여 하나의 응답으로 리더에게 보고한다.
+- 서브에이전트 실패 시 해당 하위 작업만 재시도하고, 성공한 작업은 유지한다.
+
+## 프로세스 보호
+- kill, pkill, killall 명령 사용 금지.
+- tmux kill-pane, tmux kill-window, tmux kill-session 사용 금지.
+- 다른 tmux pane이나 세션의 프로세스를 절대 종료하지 않는다.
+- 포트/파일 충돌 시 기존 프로세스를 죽이지 말고 보고한다.
 
 ## 제약
 - 사용자의 원래 목표를 축소하거나 타협안을 제시하지 않는다.
@@ -222,8 +231,6 @@ const renderState = {
   lastTokenTotal: 0,
   lastCmd: null, // 현재 실행 중인 명령어 정보
   headerPrinted: false, // 세션 헤더 출력 여부
-  // codex/event/agent_message_content_delta를 수신한 아이템 추적 (중복 렌더링 방지)
-  itemsWithNewDelta: new Set(),
   // exec outputDelta를 스트리밍한 아이템 추적 (완료 시 aggregatedOutput 중복 방지)
   execStreamedItems: new Set(),
   // ── Compact mode state ──
@@ -258,7 +265,6 @@ function endStreamMode() {
     }
     renderState.mode = "idle";
     renderState.lastItemId = null;
-    renderState.itemsWithNewDelta.clear();
   }
 }
 
@@ -402,10 +408,7 @@ function renderNotificationANSI(method, params) {
     }
 
     // ── 에이전트 메시지 스트리밍 ──
-    // codex/event/agent_message_content_delta와 중복 발화됨 — 새 이벤트가 먼저 오므로
-    // 이미 새 이벤트로 처리된 아이템이면 스킵
     case "item/agentMessage/delta": {
-      if (params.itemId && renderState.itemsWithNewDelta.has(params.itemId)) break;
       if (compact) {
         renderState.suppressedLines++;
         addToTailBuffer(params.delta || "");
@@ -418,29 +421,6 @@ function renderNotificationANSI(method, params) {
           renderState.lastItemId = params.itemId;
         }
         renderWrite(params.delta || "");
-      }
-      break;
-    }
-
-    // ── 에이전트 메시지 스트리밍 (Codex 0.114+ 새 이벤트) ──
-    // item/agentMessage/delta보다 먼저 발화됨 — 우선 렌더링하고 아이템 추적
-    case "codex/event/agent_message_content_delta": {
-      const msg = params.msg || {};
-      const itemId = msg.item_id || params.itemId;
-      const delta = msg.delta || params.delta || "";
-      if (compact) {
-        if (itemId) renderState.itemsWithNewDelta.add(itemId);
-        renderState.suppressedLines++;
-        addToTailBuffer(delta);
-      } else {
-        if (renderState.mode !== "agent" || renderState.lastItemId !== itemId) {
-          endStreamMode(); // clears itemsWithNewDelta
-          renderLabel("codex");
-          renderState.mode = "agent";
-          renderState.lastItemId = itemId;
-        }
-        if (itemId) renderState.itemsWithNewDelta.add(itemId); // add AFTER endStreamMode
-        renderWrite(delta);
       }
       break;
     }
@@ -602,7 +582,6 @@ function renderNotificationANSI(method, params) {
             addRecentEvent(`agent: ${truncateMiddle(fullText, getPaneWidth() - 12)}`);
           }
           renderState.tailBuffer = [];
-          renderState.itemsWithNewDelta.clear();
           renderCompactView();
         } else {
           endStreamMode();
@@ -754,33 +733,9 @@ function renderNotification(method, params) {
   if (viewerProc && viewerProc.stdin && !viewerProc.stdin.destroyed) {
     try {
       if (viewerProc.viewerType === "real-tui") {
-        // Real Codex TUI: write Event params directly (codex/event/* only)
-        if (method.startsWith("codex/event/")) {
-          // Inject fake SessionConfigured before first real event so the TUI
-          // initializes its primary thread channel and starts rendering.
-          if (!viewerProc._sessionSent && params.conversationId && sessionInfo) {
-            const si = sessionInfo;
-            const realSC = {
-              id: params.id || "",
-              msg: {
-                type: "session_configured",
-                session_id: params.conversationId,
-                model: si.model,
-                model_provider_id: si.modelProvider,
-                approval_policy: si.approvalPolicy,
-                sandbox_policy: normalizeSandboxPolicy(si.sandbox),
-                cwd: si.cwd,
-                history_log_id: 0,
-                history_entry_count: 0,
-              },
-              conversationId: params.conversationId,
-            };
-            const scJson = JSON.stringify(realSC);
-            viewerProc.stdin.write(scJson + "\n");
-            viewerProc._sessionSent = true;
-            log("TUI", `injected real SessionConfigured: model=${si.model} provider=${si.modelProvider}`);
-          }
-          viewerProc.stdin.write(JSON.stringify(params) + "\n");
+        // Real Codex TUI: forward item/* and turn/* events
+        if (method.startsWith("item/") || method.startsWith("turn/")) {
+          viewerProc.stdin.write(JSON.stringify({ method, params }) + "\n");
         }
       } else {
         // Blessed viewer: write full notification
@@ -1327,8 +1282,8 @@ async function markMyTasksCompleted(config) {
 }
 
 // ─── Codex App Server Session ───
-// agentName으로 effort 결정: codex-xh-* → xhigh, 그 외 → high
-let codexEffort = "high";
+// GPT 5.4 high 고정 — xhigh 사용 금지
+const codexEffort = "high";
 
 function truncateOutput(output) {
   if (MAX_RESULT_BYTES > 0 && output.length > MAX_RESULT_BYTES) {
@@ -1633,39 +1588,16 @@ class AppServerSession {
       return;
     }
 
-    // 레거시 스트리밍 이벤트 — 새 이벤트(codex/event/...)로 이미 캡처된 아이템은 스킵
     if (method === "item/agentMessage/delta") {
       const current = this.currentTurn;
       if (!current) return;
       if (current.turnId && params.turnId !== current.turnId) return;
-      // 새 이벤트에서 이미 캡처 중이면 중복 방지
-      if (params.itemId && current.itemsWithDelta.has(params.itemId)) return;
       if (typeof params.delta === "string") {
         current.chunks.push(params.delta);
         if (params.itemId) current.itemsWithDelta.add(params.itemId);
       }
       if (!current.turnId && params.turnId) {
         current.turnId = params.turnId;
-      }
-      return;
-    }
-
-    // Codex 0.114+ 새 스트리밍 이벤트 — item/agentMessage/delta보다 먼저 발화됨
-    // 우선 chunk 캡처하고 아이템 추적
-    if (method === "codex/event/agent_message_content_delta") {
-      const current = this.currentTurn;
-      if (!current) return;
-      const msg = params.msg || {};
-      const turnId = msg.turn_id || params.turnId;
-      if (current.turnId && turnId && current.turnId !== turnId) return;
-      const itemId = msg.item_id || params.itemId;
-      const delta = msg.delta || params.delta;
-      if (typeof delta === "string") {
-        current.chunks.push(delta);
-        if (itemId) current.itemsWithDelta.add(itemId);
-      }
-      if (!current.turnId && turnId) {
-        current.turnId = turnId;
       }
       return;
     }
@@ -2309,14 +2241,14 @@ async function main() {
     process.exit(1);
   }
 
-  // 이름 기반 라우팅: claude-* → Claude Code, 그 외 → Codex
-  if (config.agentName.startsWith("claude-")) {
-    return passthroughToClaude();
-  }
-
-  // Codex effort 라우팅: codex-xh-* → xhigh, 그 외 → high
-  if (config.agentName.startsWith("codex-xh-")) {
-    codexEffort = "xhigh";
+  // 라우팅: codex-* → 항상 Codex, claude-* → Claude, 그 외 → 모델명으로 판단
+  if (!config.agentName.startsWith("codex-")) {
+    const modelLower = typeof config.model === "string" ? config.model.toLowerCase() : "";
+    const isClaudeModel = modelLower.includes("claude")
+      || ["sonnet", "opus", "haiku"].includes(modelLower);
+    if (config.agentName.startsWith("claude-") || isClaudeModel) {
+      return passthroughToClaude();
+    }
   }
 
   log("INIT", `${config.agentName}@${config.teamName} (color=${config.agentColor})`);
