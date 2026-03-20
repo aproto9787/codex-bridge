@@ -721,10 +721,18 @@ const SANDBOX_CAMEL_TO_KEBAB = {
 };
 function normalizeSandboxPolicy(sandbox) {
   if (typeof sandbox === "string") {
-    return { type: SANDBOX_CAMEL_TO_KEBAB[sandbox] || sandbox };
+    const mapped = SANDBOX_CAMEL_TO_KEBAB[sandbox];
+    if (!mapped && sandbox !== "danger-full-access" && sandbox !== "read-only" && sandbox !== "workspace-write") {
+      log("SANDBOX", `unknown policy "${sandbox}", passing through as-is`);
+    }
+    return { type: mapped || sandbox };
   }
   if (sandbox && typeof sandbox === "object" && sandbox.type) {
-    return { ...sandbox, type: SANDBOX_CAMEL_TO_KEBAB[sandbox.type] || sandbox.type };
+    const mapped = SANDBOX_CAMEL_TO_KEBAB[sandbox.type];
+    if (!mapped && sandbox.type !== "danger-full-access" && sandbox.type !== "read-only" && sandbox.type !== "workspace-write") {
+      log("SANDBOX", `unknown policy type "${sandbox.type}", passing through as-is`);
+    }
+    return { ...sandbox, type: mapped || sandbox.type };
   }
   return { type: "danger-full-access" };
 }
@@ -1558,7 +1566,9 @@ class AppServerSession {
           this.sendResponse(msg.id, { decision: "approved" });
           return;
         default:
-          this.sendError(msg.id, -32601, `Unsupported server request: ${msg.method}`);
+          // full-auto 모드: 미지 승인 요청도 기본 accept (새 Codex 버전 호환)
+          log("APPROVAL", `auto-accepting unknown server request: ${msg.method}`);
+          this.sendResponse(msg.id, { decision: "accept" });
       }
     } catch (err) {
       this.sendError(msg.id, -32603, `Approval handler error: ${err.message}`);
@@ -1854,14 +1864,16 @@ async function pollLoop(config) {
     if (pendingSteerQueue.length >= MAX_PENDING_STEERS) {
       const dropped = pendingSteerQueue.shift();
       logAndRenderError("STEER-DROP", `queue full (${MAX_PENDING_STEERS}), dropped oldest (len=${dropped.length})`);
+      sendToLeader(config, `[WARN] steer queue full (${MAX_PENDING_STEERS}), dropped oldest message (len=${dropped.length}). Messages may be lost.`, "Steer queue overflow").catch(() => {});
     }
     pendingSteerQueue.push(text);
   }
 
-  // 메시지 중복 처리 방지 (content hash 기반)
-  const DEDUP_MAX = 20;
-  const recentMessageHashes = new Set();
-  const recentMessageOrder = []; // FIFO로 오래된 항목 제거
+  // 메시지 중복 처리 방지 (content hash + 시간 기반)
+  const DEDUP_MAX = 100;
+  const DEDUP_TTL_MS = 60_000; // 60초 후 만료
+  const recentMessageHashes = new Map(); // hash → timestamp
+  const recentMessageOrder = []; // { hash, ts } FIFO
   function makeMessageHash(msg) {
     // from + text 앞부분으로 경량 해시 생성
     const key = `${msg.from}|${msg.text.slice(0, 512)}`;
@@ -1872,13 +1884,16 @@ async function pollLoop(config) {
     return h.toString(36);
   }
   function isDuplicateMessage(msg) {
+    const now = Date.now();
+    // 만료된 항목 정리
+    while (recentMessageOrder.length > 0 && (now - recentMessageOrder[0].ts > DEDUP_TTL_MS || recentMessageOrder.length > DEDUP_MAX)) {
+      const old = recentMessageOrder.shift();
+      recentMessageHashes.delete(old.hash);
+    }
     const hash = makeMessageHash(msg);
     if (recentMessageHashes.has(hash)) return true;
-    recentMessageHashes.add(hash);
-    recentMessageOrder.push(hash);
-    while (recentMessageOrder.length > DEDUP_MAX) {
-      recentMessageHashes.delete(recentMessageOrder.shift());
-    }
+    recentMessageHashes.set(hash, now);
+    recentMessageOrder.push({ hash, ts: now });
     return false;
   }
 
@@ -2244,8 +2259,7 @@ async function main() {
   // 라우팅: codex-* → 항상 Codex, claude-* → Claude, 그 외 → 모델명으로 판단
   if (!config.agentName.startsWith("codex-")) {
     const modelLower = typeof config.model === "string" ? config.model.toLowerCase() : "";
-    const isClaudeModel = modelLower.includes("claude")
-      || ["sonnet", "opus", "haiku"].includes(modelLower);
+    const isClaudeModel = /claude|sonnet|opus|haiku/i.test(modelLower);
     if (config.agentName.startsWith("claude-") || isClaudeModel) {
       return passthroughToClaude();
     }

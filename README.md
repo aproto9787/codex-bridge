@@ -117,4 +117,6 @@ The bridge is **zero-dependency for core functionality** — only `ink` and `rea
 
 ## License
 
-MIT
+MIT License - see [LICENSE](LICENSE) for details.
+
+Copyright (c) 2025-2026 [aproto9787](https://github.com/aproto9787)
