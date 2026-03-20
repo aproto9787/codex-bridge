@@ -3,7 +3,7 @@
 // zero-dependency (Node.js 내장 모듈만 사용)
 
 import { readFile, writeFile, mkdir, rmdir, rename, stat as fsStat } from "node:fs/promises";
-import { existsSync, createWriteStream, openSync, closeSync, unlinkSync, watch as fsWatch } from "node:fs";
+import { existsSync, readFileSync, createWriteStream, openSync, closeSync, unlinkSync, watch as fsWatch } from "node:fs";
 import { join, basename } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
@@ -22,7 +22,7 @@ const TASKS_BASE = join(homedir(), ".claude", "tasks");
 const LEADER_NAME = "team-lead";
 
 // ─── 팀 워커 기본 지시 (thread/start baseInstructions로 주입) ───
-const BASE_INSTRUCTIONS = `\
+const BASE_INSTRUCTIONS_CORE = `\
 # 팀 워커 행동 규칙
 
 ## 기본
@@ -54,6 +54,19 @@ const BASE_INSTRUCTIONS = `\
 - 사용자의 원래 목표를 축소하거나 타협안을 제시하지 않는다.
 - "불가능하다"고 결론 내리기 전에 다른 접근법을 먼저 탐색한다.
 `;
+
+// goal이 있으면 baseInstructions에 목적 컨텍스트를 주입
+function buildBaseInstructions(teamGoal) {
+  if (!teamGoal) return BASE_INSTRUCTIONS_CORE;
+  return `${BASE_INSTRUCTIONS_CORE}
+## 팀 목적 (Goal Context)
+> ${teamGoal}
+
+- 모든 작업은 위 팀 목적에 기여해야 한다.
+- 작업의 "왜?"를 항상 의식하고, 목적에서 벗어나는 작업은 하지 않는다.
+- 판단이 불확실할 때 팀 목적을 기준으로 우선순위를 결정한다.
+`;
+}
 
 let running = true;
 let shutdownRequested = false;
@@ -124,6 +137,16 @@ function parseArgs(argv) {
     agentType: args["agent-type"],
     model: args["model"],
   };
+}
+
+// ─── Goal Context (Paperclip-inspired "왜?" 추적) ───
+function readTeamGoal(teamName) {
+  try {
+    const configPath = join(TEAMS_BASE, teamName, "config.json");
+    if (!existsSync(configPath)) return null;
+    const raw = JSON.parse(readFileSync(configPath, "utf-8"));
+    return raw.description || null;
+  } catch { return null; }
 }
 
 // ─── Path Helpers ───
@@ -1336,6 +1359,7 @@ class AppServerSession {
   constructor(opts) {
     this.cwd = opts.cwd;
     this.effort = opts.effort || "high";
+    this.teamGoal = opts.teamGoal || null;
     this.child = null;
     this.threadId = null;
     this.activeTurnId = null;
@@ -1402,7 +1426,7 @@ class AppServerSession {
         sandbox: "danger-full-access",
         cwd: this.cwd,
         // model은 Codex 자체 설정 사용 (Claude 모델명 전달 방지)
-        baseInstructions: BASE_INSTRUCTIONS,
+        baseInstructions: buildBaseInstructions(this.teamGoal),
       };
 
       const started = await this.sendRequest("thread/start", threadStartParams);
@@ -1807,9 +1831,16 @@ async function pollLoop(config) {
     updateBorderStatus(config.agentName);
   }
 
+  // Goal Context: 팀 config.json에서 목적(description) 읽기
+  const teamGoal = readTeamGoal(sanitize(config.teamName));
+  if (teamGoal) {
+    log("GOAL", `team goal: ${teamGoal.slice(0, 100)}`);
+  }
+
   const session = new AppServerSession({
     cwd: process.cwd(),
     effort: codexEffort,
+    teamGoal,
     onStatus: (status) => emitStatus(status),
     onError: (tag, msg) => {
       logAndRenderError(tag, msg);
@@ -2095,10 +2126,14 @@ async function pollLoop(config) {
             // 유휴 상태: 새 턴 시작 (비동기 — 블로킹하지 않음!)
             // pendingSteerQueue에 실패한 steer가 있으면 본문에 포함
             let fullPrompt = taskText;
+            // Goal Context: 첫 턴에 팀 목적을 프롬프트에 포함
+            if (teamGoal && !session.threadId) {
+              fullPrompt = `[GOAL] ${teamGoal}\n\n${fullPrompt}`;
+            }
             if (pendingSteerQueue.length > 0) {
               const queued = pendingSteerQueue.splice(0);
               log("STEER-DRAIN", `draining ${queued.length} queued steer messages into new turn`);
-              fullPrompt = [taskText, ...queued].join("\n\n---\n\n");
+              fullPrompt = [fullPrompt, ...queued].join("\n\n---\n\n");
             }
             log("TASK", `from=${msg.from}, len=${fullPrompt.length}`);
             // 리더에게 작업 수락 ack 전송 (비동기, 블로킹 안 함)
