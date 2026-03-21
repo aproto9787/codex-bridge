@@ -765,9 +765,41 @@ function normalizeSandboxPolicy(sandbox) {
   return { type: "danger-full-access" };
 }
 
+// ─── 네이티브 TUI 강제 redraw (Codex #15320 우회) ───
+// TUI가 외부 turn 이벤트를 받아도 request_redraw()를 안 호출하는 버그 우회
+// → tmux resize trick으로 강제 redraw 트리거
+let _lastNudgeTs = 0;
+function nudgeNativeTui(method) {
+  if (!nativeTuiPaneId) return;
+  // redraw가 필요한 이벤트만 (너무 자주 하면 깜빡임)
+  const needsRedraw =
+    method === "turn/started" ||
+    method === "turn/completed" ||
+    method === "item/agentMessage/delta" ||
+    method === "item/completed" ||
+    method === "item/commandExecution/started" ||
+    method === "item/commandExecution/completed";
+  if (!needsRedraw) return;
+
+  // 스로틀: 200ms 이내 중복 방지
+  const now = Date.now();
+  if (now - _lastNudgeTs < 200) return;
+  _lastNudgeTs = now;
+
+  // tmux resize trick: 1px 줄였다 복원 → TUI가 SIGWINCH 받아서 전체 redraw
+  try {
+    spawnSync("tmux", ["resize-pane", "-t", nativeTuiPaneId, "-R", "1"], { stdio: "ignore", timeout: 500 });
+    spawnSync("tmux", ["resize-pane", "-t", nativeTuiPaneId, "-L", "1"], { stdio: "ignore", timeout: 500 });
+  } catch {}
+}
+
 function renderNotification(method, params) {
-  // 네이티브 TUI 모드: TUI가 ws로 직접 이벤트를 받으므로 bridge 렌더링 불필요
-  if (nativeTuiPaneId) return;
+  // 네이티브 TUI 모드: TUI가 ws로 직접 이벤트를 받지만 redraw 누락 (Codex #15320)
+  // → 주요 이벤트마다 tmux로 TUI pane 강제 redraw 트리거
+  if (nativeTuiPaneId) {
+    nudgeNativeTui(method);
+    return;
+  }
 
   if (viewerProc && viewerProc.stdin && !viewerProc.stdin.destroyed) {
     try {
