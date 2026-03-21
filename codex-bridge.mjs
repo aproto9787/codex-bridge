@@ -981,11 +981,11 @@ function spawnNativeTuiPane(agentName, port, threadId) {
   const myPane = process.env.TMUX_PANE;
 
   if (myPane) {
-    // 1. TUI를 bridge pane 옆에 생성
+    // TUI를 bridge pane 아래에 생성 (세로 분할)
     const splitResult = spawnSync("tmux", [
-      "split-window", "-h",
+      "split-window", "-v",          // 세로 분할 (위: bridge, 아래: TUI)
       "-t", myPane,
-      "-d",
+      "-d",                          // 포커스 안 빼앗김 (오케 유지)
       "-P", "-F", "#{pane_id}",
       cmd,
     ], { encoding: "utf8", timeout: 5000 });
@@ -993,13 +993,13 @@ function spawnNativeTuiPane(agentName, port, threadId) {
     if (splitResult.status === 0) {
       const tuiPaneId = (splitResult.stdout || "").trim();
 
-      // bridge pane을 1칸으로 축소 (사실상 안 보임) + TUI가 나머지 차지
+      // bridge pane을 1줄로 축소 → 에이전트 이름 표시 바 역할
       try {
-        spawnSync("tmux", ["resize-pane", "-t", myPane, "-x", "1"], { stdio: "ignore", timeout: 2000 });
+        spawnSync("tmux", ["resize-pane", "-t", myPane, "-y", "1"], { stdio: "ignore", timeout: 2000 });
       } catch {}
 
       nativeTuiPaneId = tuiPaneId;
-      log("NATIVE-TUI", `TUI=${tuiPaneId}, bridge=${myPane} minimized (ws://127.0.0.1:${port}, thread=${threadId || "new"})`);
+      log("NATIVE-TUI", `TUI=${tuiPaneId}, bridge=${myPane} as status bar (ws://127.0.0.1:${port}, thread=${threadId || "new"})`);
 
       try {
         spawnSync("tmux", ["set-option", "-p", "-t", tuiPaneId, "remain-on-exit", "on"], { stdio: "ignore", timeout: 2000 });
@@ -2037,6 +2037,11 @@ async function pollLoop(config) {
     lastStatusSentAt = now;
     sendToLeader(config, `[STATUS] ${status}`, status).catch(() => {});
     updateBorderStatus(config.agentName);
+    // 네이티브 TUI 모드: bridge pane 1줄에 상태 표시
+    if (nativeTuiPaneId) {
+      const label = `\x1b[1;36m ${config.agentName} \x1b[0m \x1b[33m${status}\x1b[0m`;
+      process.stderr.write(`\r\x1b[2K${label}`);
+    }
   }
 
   // Goal Context: 팀 config.json에서 목적(description) 읽기
