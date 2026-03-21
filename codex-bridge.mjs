@@ -961,96 +961,64 @@ function getRandomPort() {
   });
 }
 
-function spawnNativeTuiPane(agentName, port, threadId) {
-  if (!process.env.TMUX) {
-    log("NATIVE-TUI", "not in tmux, cannot spawn native TUI pane");
-    return null;
-  }
+let nativeTuiChild = null; // 네이티브 TUI child process
 
+function spawnNativeTuiInPlace(agentName, port, threadId) {
   const codexBin = findCodexAlphaBin();
   if (!codexBin) {
     log("NATIVE-TUI", "codex-alpha binary not found, skipping native TUI");
     return null;
   }
 
-  // threadId가 있으면 resume으로 같은 thread에 붙음 (핵심!)
-  const remoteArg = `--remote ws://127.0.0.1:${port}`;
-  const cmd = threadId
-    ? `${JSON.stringify(codexBin)} resume ${threadId} ${remoteArg} --enable tui_app_server`
-    : `${JSON.stringify(codexBin)} ${remoteArg} --enable tui_app_server`;
-  const myPane = process.env.TMUX_PANE;
+  // TUI를 bridge와 같은 pane에서 실행 (stdio: "inherit" → 터미널 공유)
+  // bridge는 뒤에서 IPC만 처리, TUI가 화면을 차지
+  const args = threadId
+    ? ["resume", threadId, "--remote", `ws://127.0.0.1:${port}`, "--enable", "tui_app_server"]
+    : ["--remote", `ws://127.0.0.1:${port}`, "--enable", "tui_app_server"];
 
-  if (myPane) {
-    // TUI를 bridge pane 아래에 생성 (세로 분할)
-    const splitResult = spawnSync("tmux", [
-      "split-window", "-v",          // 세로 분할 (위: bridge, 아래: TUI)
-      "-t", myPane,
-      "-d",                          // 포커스 안 빼앗김 (오케 유지)
-      "-P", "-F", "#{pane_id}",
-      cmd,
-    ], { encoding: "utf8", timeout: 5000 });
+  log("NATIVE-TUI", `spawning in-place: ${codexBin} ${args.join(" ")}`);
 
-    if (splitResult.status === 0) {
-      const tuiPaneId = (splitResult.stdout || "").trim();
+  const child = spawn(codexBin, args, {
+    stdio: "inherit",  // TUI가 bridge의 터미널을 직접 사용
+    cwd: process.cwd(),
+    env: { ...process.env },
+  });
 
-      // bridge pane을 1줄로 축소 → 에이전트 이름 표시 바 역할
-      try {
-        spawnSync("tmux", ["resize-pane", "-t", myPane, "-y", "1"], { stdio: "ignore", timeout: 2000 });
-      } catch {}
+  nativeTuiChild = child;
+  nativeTuiPaneId = "in-place"; // pane 분리 없음 표시
 
-      nativeTuiPaneId = tuiPaneId;
-      log("NATIVE-TUI", `TUI=${tuiPaneId}, bridge=${myPane} as status bar (ws://127.0.0.1:${port}, thread=${threadId || "new"})`);
+  child.on("close", (code) => {
+    log("NATIVE-TUI", `TUI exited (code=${code})`);
+    nativeTuiChild = null;
+    nativeTuiPaneId = null;
+  });
 
-      try {
-        spawnSync("tmux", ["set-option", "-p", "-t", tuiPaneId, "remain-on-exit", "on"], { stdio: "ignore", timeout: 2000 });
-      } catch {}
+  child.on("error", (err) => {
+    log("NATIVE-TUI", `TUI error: ${err.message}`);
+    nativeTuiChild = null;
+    nativeTuiPaneId = null;
+  });
 
-      // 포커스를 오케(이전 pane)로 복원
-      try {
-        spawnSync("tmux", ["select-pane", "-l"], { stdio: "ignore", timeout: 2000 });
-      } catch {}
-
-      return tuiPaneId;
-    }
-    log("NATIVE-TUI", `split-window failed: ${splitResult.stderr?.trim()}, falling back to session`);
+  // pane 제목을 에이전트 이름으로 설정
+  if (process.env.TMUX) {
+    try {
+      spawnSync("tmux", ["select-pane", "-T", `${agentName} [codex-tui]`], { stdio: "ignore", timeout: 2000 });
+      // 포커스를 오케로 복원
+      spawnSync("tmux", ["select-pane", "-l"], { stdio: "ignore", timeout: 2000 });
+    } catch {}
   }
 
-  // fallback: 별도 tmux 세션 (TMUX_PANE 없을 때)
-  const sessionName = `tui-${agentName}-${process.pid}`;
-  const result = spawnSync("tmux", [
-    "new-session", "-d",
-    "-s", sessionName,
-    "-x", "250", "-y", "60",
-    "-P", "-F", "#{pane_id}",
-    cmd,
-  ], { encoding: "utf8", timeout: 5000 });
-
-  if (result.status !== 0) {
-    log("NATIVE-TUI", `tmux new-session failed: ${result.stderr?.trim()}`);
-    return null;
-  }
-
-  const paneId = (result.stdout || "").trim();
-  nativeTuiPaneId = paneId;
-  nativeTuiSessionName = sessionName;
-  log("NATIVE-TUI", `TUI session created: ${sessionName} pane=${paneId} (ws://127.0.0.1:${port})`);
-  return paneId;
+  log("NATIVE-TUI", `TUI running in-place (pid=${child.pid}, thread=${threadId || "new"})`);
+  return "in-place";
 }
 
 function closeNativeTuiPane() {
-  if (nativeTuiSessionName) {
-    try {
-      spawnSync("tmux", ["kill-session", "-t", nativeTuiSessionName], { stdio: "ignore", timeout: 2000 });
-    } catch {}
-    nativeTuiSessionName = null;
-    nativeTuiPaneId = null;
-    return;
+  if (nativeTuiChild && !nativeTuiChild.killed) {
+    nativeTuiChild.kill("SIGTERM");
+    nativeTuiChild = null;
   }
-  if (!nativeTuiPaneId) return;
-  try {
-    spawnSync("tmux", ["kill-pane", "-t", nativeTuiPaneId], { stdio: "ignore", timeout: 2000 });
-  } catch {}
   nativeTuiPaneId = null;
+  nativeTuiSessionName = null;
 }
 
 function attachViewerHandlers(proc) {
@@ -2066,7 +2034,7 @@ async function pollLoop(config) {
       emitStatus(status);
       // 네이티브 TUI: session ready 시점에 tmux pane 스폰 (threadId로 resume)
       if (config._useNativeTui && status === "session ready" && !nativeTuiPaneId && wsPort) {
-        spawnNativeTuiPane(config.agentName, wsPort, session.threadId);
+        spawnNativeTuiInPlace(config.agentName, wsPort, session.threadId);
       }
     },
     onError: (tag, msg) => {
