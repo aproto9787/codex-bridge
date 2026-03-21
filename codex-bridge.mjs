@@ -926,7 +926,7 @@ function findCodexAlphaBin() {
   if (process.env.CODEX_ALPHA_BIN && existsSync(process.env.CODEX_ALPHA_BIN)) {
     return process.env.CODEX_ALPHA_BIN;
   }
-  // 2. Known paths
+  // 2. Known paths (codex-alpha, codex-next)
   const knownPaths = [
     join(homedir(), ".local", "bin", "codex-alpha"),
     join(homedir(), ".local", "bin", "codex-next"),
@@ -934,6 +934,18 @@ function findCodexAlphaBin() {
   ];
   for (const p of knownPaths) {
     if (existsSync(p)) return p;
+  }
+  // 3. 기본 codex가 0.117+이면 그대로 사용
+  const ver = getCodexVersion();
+  if (ver) {
+    const m = ver.match(/^(\d+)\.(\d+)\.(\d+)/);
+    if (m && (Number(m[1]) > 0 || Number(m[2]) >= 117)) {
+      try {
+        const r = spawnSync("which", ["codex"], { encoding: "utf8", timeout: 3000 });
+        const p = (r.stdout || "").trim();
+        if (p && existsSync(p)) return p;
+      } catch {}
+    }
   }
   return null;
 }
@@ -2508,12 +2520,26 @@ async function main() {
   }
   _borderAgentName = config.agentName;
 
-  // ─── 네이티브 Codex TUI 모드 (CODEX_BRIDGE_NATIVE_TUI=1) ───
-  // app-server를 WebSocket으로 띄우고, 네이티브 TUI가 --remote로 연결
-  const useNativeTui = process.env.CODEX_BRIDGE_NATIVE_TUI === "1" && process.env.TMUX && findCodexAlphaBin();
+  // ─── 네이티브 Codex TUI 자동 감지 ───
+  // 1. CODEX_BRIDGE_NATIVE_TUI=1 → 강제 활성화
+  // 2. codex 0.117+ → 자동 활성화
+  // 3. codex-alpha 바이너리 존재 → 자동 활성화
+  // 4. CODEX_BRIDGE_NATIVE_TUI=0 → 강제 비활성화
+  const nativeTuiBin = findCodexAlphaBin();
+  const codexVersion = getCodexVersion();
+  const codexSupportsNativeTui = codexVersion && (() => {
+    const m = codexVersion.match(/^(\d+)\.(\d+)\.(\d+)/);
+    if (!m) return false;
+    const [, major, minor] = m.map(Number);
+    return major > 0 || minor >= 117;
+  })();
+  const useNativeTui = process.env.CODEX_BRIDGE_NATIVE_TUI !== "0"
+    && process.env.TMUX
+    && (process.env.CODEX_BRIDGE_NATIVE_TUI === "1" || codexSupportsNativeTui || nativeTuiBin);
+  log("TUI-DETECT", `codex=${codexVersion || "?"}, alpha=${nativeTuiBin || "none"}, native=${useNativeTui}`);
   if (useNativeTui) {
     wsPort = await getRandomPort();
-    log("NATIVE-TUI", `WebSocket mode enabled, port=${wsPort}`);
+    log("NATIVE-TUI", `WebSocket mode enabled, port=${wsPort}, bin=${nativeTuiBin}`);
     // 네이티브 TUI pane은 app-server ready 후 스폰 (pollLoop 진입 전)
     config._useNativeTui = true;
   }
