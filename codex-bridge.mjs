@@ -1004,6 +1004,12 @@ function spawnNativeTuiPane(agentName, port, threadId) {
       try {
         spawnSync("tmux", ["set-option", "-p", "-t", tuiPaneId, "remain-on-exit", "on"], { stdio: "ignore", timeout: 2000 });
       } catch {}
+
+      // 포커스를 오케(이전 pane)로 복원
+      try {
+        spawnSync("tmux", ["select-pane", "-l"], { stdio: "ignore", timeout: 2000 });
+      } catch {}
+
       return tuiPaneId;
     }
     log("NATIVE-TUI", `split-window failed: ${splitResult.stderr?.trim()}, falling back to session`);
