@@ -765,41 +765,9 @@ function normalizeSandboxPolicy(sandbox) {
   return { type: "danger-full-access" };
 }
 
-// ─── 네이티브 TUI 강제 redraw (Codex #15320 우회) ───
-// TUI가 외부 turn 이벤트를 받아도 request_redraw()를 안 호출하는 버그 우회
-// → tmux resize trick으로 강제 redraw 트리거
-let _lastNudgeTs = 0;
-function nudgeNativeTui(method) {
-  if (!nativeTuiPaneId) return;
-  // redraw가 필요한 이벤트만 (너무 자주 하면 깜빡임)
-  const needsRedraw =
-    method === "turn/started" ||
-    method === "turn/completed" ||
-    method === "item/agentMessage/delta" ||
-    method === "item/completed" ||
-    method === "item/commandExecution/started" ||
-    method === "item/commandExecution/completed";
-  if (!needsRedraw) return;
-
-  // 스로틀: 200ms 이내 중복 방지
-  const now = Date.now();
-  if (now - _lastNudgeTs < 200) return;
-  _lastNudgeTs = now;
-
-  // tmux resize trick: 1px 줄였다 복원 → TUI가 SIGWINCH 받아서 전체 redraw
-  try {
-    spawnSync("tmux", ["resize-pane", "-t", nativeTuiPaneId, "-R", "1"], { stdio: "ignore", timeout: 500 });
-    spawnSync("tmux", ["resize-pane", "-t", nativeTuiPaneId, "-L", "1"], { stdio: "ignore", timeout: 500 });
-  } catch {}
-}
-
 function renderNotification(method, params) {
-  // 네이티브 TUI 모드: TUI가 ws로 직접 이벤트를 받지만 redraw 누락 (Codex #15320)
-  // → 주요 이벤트마다 tmux로 TUI pane 강제 redraw 트리거
-  if (nativeTuiPaneId) {
-    nudgeNativeTui(method);
-    return;
-  }
+  // 네이티브 TUI 모드: resume으로 같은 thread를 공유하므로 bridge 렌더링 불필요
+  if (nativeTuiPaneId) return;
 
   if (viewerProc && viewerProc.stdin && !viewerProc.stdin.destroyed) {
     try {
@@ -1013,26 +981,52 @@ function spawnNativeTuiPane(agentName, port, threadId) {
   const myPane = process.env.TMUX_PANE;
 
   if (myPane) {
-    // 워커 pane을 split → bridge 축소, TUI가 메인
+    // bridge pane 자리를 TUI로 교체:
+    // 1. TUI를 별도 pane으로 생성 (bridge pane과 같은 윈도우, 보이지 않게)
+    // 2. bridge pane과 TUI pane을 swap
+    // → 결과: TUI가 bridge의 원래 위치를 차지, bridge pane은 사라짐(백그라운드)
+
+    // TUI를 숨은 pane으로 생성
     const splitResult = spawnSync("tmux", [
-      "split-window", "-h",          // 수평 분할 (좌: bridge, 우: TUI)
-      "-t", myPane,                  // 자기 pane 기준으로 split
-      "-l", "85%",                   // TUI가 85% 차지
-      "-d",                          // 포커스를 빼앗지 않음 (오케 유지)
+      "split-window", "-h",
+      "-t", myPane,
+      "-l", "1",                     // 최소 크기 (곧 swap됨)
+      "-d",                          // 포커스 안 빼앗김
       "-P", "-F", "#{pane_id}",
       cmd,
     ], { encoding: "utf8", timeout: 5000 });
 
     if (splitResult.status === 0) {
-      const paneId = (splitResult.stdout || "").trim();
-      nativeTuiPaneId = paneId;
-      log("NATIVE-TUI", `TUI pane split from ${myPane}: ${paneId} (ws://127.0.0.1:${port}, thread=${threadId || "new"})`);
+      const tuiPaneId = (splitResult.stdout || "").trim();
 
-      // TUI pane이 죽어도 유지
+      // TUI pane과 bridge pane을 swap → TUI가 bridge 자리 차지
+      const swapResult = spawnSync("tmux", [
+        "swap-pane", "-s", tuiPaneId, "-t", myPane,
+      ], { stdio: "ignore", timeout: 2000 });
+
+      if (swapResult.status === 0) {
+        // swap 후: myPane = TUI (원래 위치), tuiPaneId = bridge (작은 pane)
+        // bridge pane(tuiPaneId)을 숨김 — 별도 윈도우로 분리
+        try {
+          spawnSync("tmux", ["break-pane", "-d", "-t", tuiPaneId, "-n", `bridge:${agentName}`], { stdio: "ignore", timeout: 2000 });
+        } catch {}
+
+        nativeTuiPaneId = myPane; // TUI가 원래 bridge 위치를 차지
+        log("NATIVE-TUI", `TUI swapped into ${myPane}, bridge hidden (ws://127.0.0.1:${port}, thread=${threadId || "new"})`);
+
+        try {
+          spawnSync("tmux", ["set-option", "-p", "-t", myPane, "remain-on-exit", "on"], { stdio: "ignore", timeout: 2000 });
+        } catch {}
+        return myPane;
+      }
+
+      // swap 실패 시 fallback: split 유지
+      nativeTuiPaneId = tuiPaneId;
+      log("NATIVE-TUI", `swap failed, keeping split: ${tuiPaneId} (ws://127.0.0.1:${port})`);
       try {
-        spawnSync("tmux", ["set-option", "-p", "-t", paneId, "remain-on-exit", "on"], { stdio: "ignore", timeout: 2000 });
+        spawnSync("tmux", ["set-option", "-p", "-t", tuiPaneId, "remain-on-exit", "on"], { stdio: "ignore", timeout: 2000 });
       } catch {}
-      return paneId;
+      return tuiPaneId;
     }
     log("NATIVE-TUI", `split-window failed: ${splitResult.stderr?.trim()}, falling back to session`);
   }
