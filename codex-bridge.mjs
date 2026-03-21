@@ -981,17 +981,11 @@ function spawnNativeTuiPane(agentName, port, threadId) {
   const myPane = process.env.TMUX_PANE;
 
   if (myPane) {
-    // bridge pane 자리를 TUI로 교체:
-    // 1. TUI를 별도 pane으로 생성 (bridge pane과 같은 윈도우, 보이지 않게)
-    // 2. bridge pane과 TUI pane을 swap
-    // → 결과: TUI가 bridge의 원래 위치를 차지, bridge pane은 사라짐(백그라운드)
-
-    // TUI를 숨은 pane으로 생성
+    // 1. TUI를 bridge pane 옆에 생성
     const splitResult = spawnSync("tmux", [
       "split-window", "-h",
       "-t", myPane,
-      "-l", "1",                     // 최소 크기 (곧 swap됨)
-      "-d",                          // 포커스 안 빼앗김
+      "-d",
       "-P", "-F", "#{pane_id}",
       cmd,
     ], { encoding: "utf8", timeout: 5000 });
@@ -999,30 +993,14 @@ function spawnNativeTuiPane(agentName, port, threadId) {
     if (splitResult.status === 0) {
       const tuiPaneId = (splitResult.stdout || "").trim();
 
-      // TUI pane과 bridge pane을 swap → TUI가 bridge 자리 차지
-      const swapResult = spawnSync("tmux", [
-        "swap-pane", "-s", tuiPaneId, "-t", myPane,
-      ], { stdio: "ignore", timeout: 2000 });
+      // 2. bridge pane(myPane)을 숨은 윈도우로 분리 → TUI가 100% 차지
+      try {
+        spawnSync("tmux", ["break-pane", "-d", "-t", myPane, "-n", `bridge:${agentName}`], { stdio: "ignore", timeout: 2000 });
+      } catch {}
 
-      if (swapResult.status === 0) {
-        // swap 후: myPane = TUI (원래 위치), tuiPaneId = bridge (작은 pane)
-        // bridge pane(tuiPaneId)을 숨김 — 별도 윈도우로 분리
-        try {
-          spawnSync("tmux", ["break-pane", "-d", "-t", tuiPaneId, "-n", `bridge:${agentName}`], { stdio: "ignore", timeout: 2000 });
-        } catch {}
-
-        nativeTuiPaneId = myPane; // TUI가 원래 bridge 위치를 차지
-        log("NATIVE-TUI", `TUI swapped into ${myPane}, bridge hidden (ws://127.0.0.1:${port}, thread=${threadId || "new"})`);
-
-        try {
-          spawnSync("tmux", ["set-option", "-p", "-t", myPane, "remain-on-exit", "on"], { stdio: "ignore", timeout: 2000 });
-        } catch {}
-        return myPane;
-      }
-
-      // swap 실패 시 fallback: split 유지
       nativeTuiPaneId = tuiPaneId;
-      log("NATIVE-TUI", `swap failed, keeping split: ${tuiPaneId} (ws://127.0.0.1:${port})`);
+      log("NATIVE-TUI", `TUI=${tuiPaneId}, bridge hidden (ws://127.0.0.1:${port}, thread=${threadId || "new"})`);
+
       try {
         spawnSync("tmux", ["set-option", "-p", "-t", tuiPaneId, "remain-on-exit", "on"], { stdio: "ignore", timeout: 2000 });
       } catch {}
