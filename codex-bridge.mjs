@@ -7,6 +7,7 @@ import { existsSync, readFileSync, createWriteStream, openSync, closeSync, unlin
 import { join, basename } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
+import { createServer } from "node:net";
 
 // ─── Constants ───
 const POLL_INTERVAL_MS = 500;
@@ -35,11 +36,12 @@ const BASE_INSTRUCTIONS_CORE = `\
 - 결과에 확신이 없는 부분은 명시적으로 표시한다.
 - 에러나 문제를 발견하면 숨기지 않고 보고한다.
 
-## 멀티에이전트 활용
-- 복잡한 태스크는 반드시 서브에이전트를 스폰하여 병렬 처리한다.
-- 서브에이전트 활용 기준: 독립적으로 분할 가능한 하위 작업이 2개 이상일 때.
+## 멀티에이전트 활용 (적극 분할 원칙)
+- **기본 자세: 의심스러우면 서브에이전트로 분할한다.**
+- 서브에이전트 스폰 기준: 파일 2개 이상 수정 OR 탐색 범위가 디렉토리 3개 이상.
+- 직접 처리 범위: **파일 1개, 단일 함수 수정만** 직접 처리한다.
 - 리더가 "서브에이전트로 병렬 처리하라"고 명시한 경우, 하위 작업을 최대한 독립적으로 분할하여 동시 실행한다.
-- 단순 작업(파일 1~2개 수정, 단일 함수 구현 등)은 직접 처리한다.
+- 서브에이전트 수: 하위 작업 수만큼 스폰하되 **최대 4개**.
 - 서브에이전트에게도 동일한 행동 규칙(간결, 범위 준수, 과잉 금지)을 적용한다.
 - 서브에이전트 결과를 통합하여 하나의 응답으로 리더에게 보고한다.
 - 서브에이전트 실패 시 해당 하위 작업만 재시도하고, 성공한 작업은 유지한다.
@@ -80,6 +82,9 @@ let sessionInfo = null;
 let currentPollMs = POLL_INTERVAL_MS;
 let leaderOutbox = null; // pollLoop에서 초기화
 let _borderAgentName = null; // border-status용 에이전트 이름 (main에서 설정)
+let nativeTuiPaneId = null;       // 네이티브 Codex TUI pane ID (cleanup용)
+let nativeTuiSessionName = null;  // 네이티브 TUI tmux 세션 이름 (cleanup용)
+let wsPort = null;                // WebSocket app-server 포트 (네이티브 TUI용)
 
 // ─── Inline mkdir-based Lock (proper-lockfile compatible) ───
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -761,6 +766,9 @@ function normalizeSandboxPolicy(sandbox) {
 }
 
 function renderNotification(method, params) {
+  // 네이티브 TUI 모드: TUI가 ws로 직접 이벤트를 받으므로 bridge 렌더링 불필요
+  if (nativeTuiPaneId) return;
+
   if (viewerProc && viewerProc.stdin && !viewerProc.stdin.destroyed) {
     try {
       if (viewerProc.viewerType === "real-tui") {
@@ -909,6 +917,113 @@ function spawnTuiTmuxPane(agentName) {
     _sessionSent: false,
     _isTmux: true,
   };
+}
+
+// ─── 네이티브 Codex TUI (app-server WebSocket 경유) ───
+
+function findCodexAlphaBin() {
+  // 1. CODEX_ALPHA_BIN env
+  if (process.env.CODEX_ALPHA_BIN && existsSync(process.env.CODEX_ALPHA_BIN)) {
+    return process.env.CODEX_ALPHA_BIN;
+  }
+  // 2. Known paths
+  const knownPaths = [
+    join(homedir(), ".local", "bin", "codex-alpha"),
+    join(homedir(), ".local", "bin", "codex-next"),
+    "/usr/local/bin/codex-alpha",
+  ];
+  for (const p of knownPaths) {
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+function getRandomPort() {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.listen(0, "127.0.0.1", () => {
+      const port = srv.address().port;
+      srv.close(() => resolve(port));
+    });
+    srv.on("error", reject);
+  });
+}
+
+function spawnNativeTuiPane(agentName, port) {
+  if (!process.env.TMUX) {
+    log("NATIVE-TUI", "not in tmux, cannot spawn native TUI pane");
+    return null;
+  }
+
+  const codexBin = findCodexAlphaBin();
+  if (!codexBin) {
+    log("NATIVE-TUI", "codex-alpha binary not found, skipping native TUI");
+    return null;
+  }
+
+  const cmd = `${JSON.stringify(codexBin)} --remote ws://127.0.0.1:${port} --enable tui_app_server`;
+  const myPane = process.env.TMUX_PANE;
+
+  if (myPane) {
+    // 실제 TeamCreate: 워커 pane을 split → bridge 축소, TUI가 메인
+    const splitResult = spawnSync("tmux", [
+      "split-window", "-h",          // 수평 분할 (좌: bridge, 우: TUI)
+      "-t", myPane,                  // 자기 pane 기준으로 split
+      "-l", "85%",                   // TUI가 85% 차지
+      "-P", "-F", "#{pane_id}",
+      cmd,
+    ], { encoding: "utf8", timeout: 5000 });
+
+    if (splitResult.status === 0) {
+      const paneId = (splitResult.stdout || "").trim();
+      nativeTuiPaneId = paneId;
+      log("NATIVE-TUI", `TUI pane split from ${myPane}: ${paneId} (ws://127.0.0.1:${port})`);
+
+      // TUI pane이 죽어도 유지
+      try {
+        spawnSync("tmux", ["set-option", "-p", "-t", paneId, "remain-on-exit", "on"], { stdio: "ignore", timeout: 2000 });
+      } catch {}
+      return paneId;
+    }
+    log("NATIVE-TUI", `split-window failed: ${splitResult.stderr?.trim()}, falling back to session`);
+  }
+
+  // fallback: 별도 tmux 세션 (TMUX_PANE 없을 때)
+  const sessionName = `tui-${agentName}-${process.pid}`;
+  const result = spawnSync("tmux", [
+    "new-session", "-d",
+    "-s", sessionName,
+    "-x", "250", "-y", "60",
+    "-P", "-F", "#{pane_id}",
+    cmd,
+  ], { encoding: "utf8", timeout: 5000 });
+
+  if (result.status !== 0) {
+    log("NATIVE-TUI", `tmux new-session failed: ${result.stderr?.trim()}`);
+    return null;
+  }
+
+  const paneId = (result.stdout || "").trim();
+  nativeTuiPaneId = paneId;
+  nativeTuiSessionName = sessionName;
+  log("NATIVE-TUI", `TUI session created: ${sessionName} pane=${paneId} (ws://127.0.0.1:${port})`);
+  return paneId;
+}
+
+function closeNativeTuiPane() {
+  if (nativeTuiSessionName) {
+    try {
+      spawnSync("tmux", ["kill-session", "-t", nativeTuiSessionName], { stdio: "ignore", timeout: 2000 });
+    } catch {}
+    nativeTuiSessionName = null;
+    nativeTuiPaneId = null;
+    return;
+  }
+  if (!nativeTuiPaneId) return;
+  try {
+    spawnSync("tmux", ["kill-pane", "-t", nativeTuiPaneId], { stdio: "ignore", timeout: 2000 });
+  } catch {}
+  nativeTuiPaneId = null;
 }
 
 function attachViewerHandlers(proc) {
@@ -1360,6 +1475,9 @@ class AppServerSession {
     this.cwd = opts.cwd;
     this.effort = opts.effort || "high";
     this.teamGoal = opts.teamGoal || null;
+    this.useWebSocket = opts.useWebSocket || false;
+    this.wsPort = opts.wsPort || null;
+    this.ws = null;       // WebSocket 연결 (ws 모드)
     this.child = null;
     this.threadId = null;
     this.activeTurnId = null;
@@ -1392,9 +1510,13 @@ class AppServerSession {
   }
 
   async startInternal() {
+    const codexBin = (this.useWebSocket && findCodexAlphaBin()) || "codex";
     const args = ["app-server", "-c", `model_reasoning_effort="${this.effort}"`];
-    const child = spawn("codex", args, {
-      stdio: ["pipe", "pipe", "pipe"],
+    if (this.useWebSocket && this.wsPort) {
+      args.push("--listen", `ws://127.0.0.1:${this.wsPort}`);
+    }
+    const child = spawn(codexBin, args, {
+      stdio: this.useWebSocket ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
       cwd: this.cwd,
       env: { ...process.env },
     });
@@ -1402,18 +1524,61 @@ class AppServerSession {
     this.child = child;
     currentChild = child;
 
-    child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => this.handleStdout(chunk));
-    child.stderr.on("data", (chunk) => {
-      const text = String(chunk).trim();
-      if (text) {
-        log("APP-SERVER", text);
-        this.onError?.("APP-SERVER", text);
-      }
-    });
-    child.on("close", (code, signal) => this.handleClose(code, signal));
-    child.on("error", (err) => this.handleFatal(err));
+
+    if (this.useWebSocket && this.wsPort) {
+      // WebSocket 모드: stderr에서 "listening on" 대기 → ws 연결
+      child.stderr.on("data", (chunk) => {
+        const text = String(chunk).trim();
+        if (text) log("APP-SERVER", text);
+      });
+      child.on("close", (code, signal) => this.handleClose(code, signal));
+      child.on("error", (err) => this.handleFatal(err));
+
+      // readyz 대기 후 WebSocket 연결
+      const wsUrl = `ws://127.0.0.1:${this.wsPort}`;
+      log("WS", `waiting for app-server on ${wsUrl}...`);
+      await this.waitForReady(this.wsPort);
+
+      const { default: WebSocket } = await import("ws");
+      const ws = new WebSocket(wsUrl);
+      await new Promise((resolve, reject) => {
+        ws.on("open", resolve);
+        ws.on("error", reject);
+        setTimeout(() => reject(new Error("WebSocket connect timeout")), 10000);
+      });
+      this.ws = ws;
+      ws.on("message", (data) => {
+        const text = String(data);
+        for (const line of text.split("\n")) {
+          if (!line.trim()) continue;
+          try {
+            this.handleRpcMessage(JSON.parse(line));
+          } catch {
+            log("WS", `non-JSON: ${line.slice(0, 120)}`);
+          }
+        }
+      });
+      ws.on("close", () => {
+        log("WS", "WebSocket closed");
+        this.ws = null;
+      });
+      ws.on("error", (err) => log("WS", `error: ${err.message}`));
+      log("WS", "connected to app-server");
+    } else {
+      // stdio 모드 (기존)
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => this.handleStdout(chunk));
+      child.stderr.on("data", (chunk) => {
+        const text = String(chunk).trim();
+        if (text) {
+          log("APP-SERVER", text);
+          this.onError?.("APP-SERVER", text);
+        }
+      });
+      child.on("close", (code, signal) => this.handleClose(code, signal));
+      child.on("error", (err) => this.handleFatal(err));
+    }
 
     try {
       const initResult = await this.sendRequest("initialize", {
@@ -1461,11 +1626,33 @@ class AppServerSession {
     }
   }
 
+  async waitForReady(port, timeoutMs = 15000) {
+    const { request } = await import("node:http");
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const ok = await new Promise((resolve) => {
+        const req = request(`http://127.0.0.1:${port}/readyz`, { timeout: 1000 }, (res) => {
+          resolve(res.statusCode === 200);
+        });
+        req.on("error", () => resolve(false));
+        req.end();
+      });
+      if (ok) return;
+      await sleep(200);
+    }
+    throw new Error(`app-server readyz timeout (${timeoutMs}ms)`);
+  }
+
   sendRaw(message) {
+    const json = JSON.stringify(message);
+    if (this.ws && this.ws.readyState === 1 /* OPEN */) {
+      this.ws.send(json);
+      return;
+    }
     if (!this.child || this.child.killed || !this.child.stdin.writable) {
       throw new Error("app-server process is not writable");
     }
-    this.child.stdin.write(`${JSON.stringify(message)}\n`);
+    this.child.stdin.write(`${json}\n`);
   }
 
   sendNotification(method, params = {}) {
@@ -1841,7 +2028,15 @@ async function pollLoop(config) {
     cwd: process.cwd(),
     effort: codexEffort,
     teamGoal,
-    onStatus: (status) => emitStatus(status),
+    useWebSocket: !!config._useNativeTui,
+    wsPort: wsPort,
+    onStatus: (status) => {
+      emitStatus(status);
+      // 네이티브 TUI: session ready 시점에 tmux pane 스폰
+      if (config._useNativeTui && status === "session ready" && !nativeTuiPaneId && wsPort) {
+        spawnNativeTuiPane(config.agentName, wsPort);
+      }
+    },
     onError: (tag, msg) => {
       logAndRenderError(tag, msg);
       sendToLeader(config, `[ERROR] [${tag}] ${msg}`, `Error: ${tag}`).catch(() => {});
@@ -2313,10 +2508,19 @@ async function main() {
   }
   _borderAgentName = config.agentName;
 
+  // ─── 네이티브 Codex TUI 모드 (CODEX_BRIDGE_NATIVE_TUI=1) ───
+  // app-server를 WebSocket으로 띄우고, 네이티브 TUI가 --remote로 연결
+  const useNativeTui = process.env.CODEX_BRIDGE_NATIVE_TUI === "1" && process.env.TMUX && findCodexAlphaBin();
+  if (useNativeTui) {
+    wsPort = await getRandomPort();
+    log("NATIVE-TUI", `WebSocket mode enabled, port=${wsPort}`);
+    // 네이티브 TUI pane은 app-server ready 후 스폰 (pollLoop 진입 전)
+    config._useNativeTui = true;
+  }
+
   // TUI 뷰어: 기본 비활성 (ANSI fallback)
-  // 이유: viewer pane이 워커당 1개 추가 → pane 수 2배, Ink native crash 위험
-  // CODEX_BRIDGE_TUI=1로 명시적 활성화 가능
-  if (process.env.CODEX_BRIDGE_TUI === "1") {
+  // CODEX_BRIDGE_TUI=1로 Ink 뷰어, CODEX_BRIDGE_NATIVE_TUI=1로 네이티브 TUI
+  if (!useNativeTui && process.env.CODEX_BRIDGE_TUI === "1") {
     if (process.env.TMUX) {
       viewerProc = spawnTuiTmuxPane(config.agentName);
       if (!viewerProc) {
@@ -2325,7 +2529,7 @@ async function main() {
     } else {
       viewerProc = spawnTuiViewer(config.agentName);
     }
-  } else {
+  } else if (!useNativeTui) {
     // ANSI fallback (기본값) — bridge pane에서 직접 렌더링
     log("TUI", "using ANSI fallback (default)");
     if (process.env.TMUX) {
@@ -2342,6 +2546,7 @@ async function main() {
   await pollLoop(config);
 
   log("EXIT", "bridge shutting down");
+  closeNativeTuiPane();
   closeViewer();
   closeLogFile();
   // 리더가 shutdown_approved를 읽을 시간 확보 후 pane 종료
