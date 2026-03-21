@@ -993,13 +993,13 @@ function spawnNativeTuiPane(agentName, port, threadId) {
     if (splitResult.status === 0) {
       const tuiPaneId = (splitResult.stdout || "").trim();
 
-      // 2. bridge pane(myPane)을 숨은 윈도우로 분리 → TUI가 100% 차지
+      // bridge pane을 1칸으로 축소 (사실상 안 보임) + TUI가 나머지 차지
       try {
-        spawnSync("tmux", ["break-pane", "-d", "-t", myPane, "-n", `bridge:${agentName}`], { stdio: "ignore", timeout: 2000 });
+        spawnSync("tmux", ["resize-pane", "-t", myPane, "-x", "1"], { stdio: "ignore", timeout: 2000 });
       } catch {}
 
       nativeTuiPaneId = tuiPaneId;
-      log("NATIVE-TUI", `TUI=${tuiPaneId}, bridge hidden (ws://127.0.0.1:${port}, thread=${threadId || "new"})`);
+      log("NATIVE-TUI", `TUI=${tuiPaneId}, bridge=${myPane} minimized (ws://127.0.0.1:${port}, thread=${threadId || "new"})`);
 
       try {
         spawnSync("tmux", ["set-option", "-p", "-t", tuiPaneId, "remain-on-exit", "on"], { stdio: "ignore", timeout: 2000 });
