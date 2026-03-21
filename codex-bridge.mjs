@@ -2447,7 +2447,11 @@ function passthroughToClaude() {
   const child = spawn(claudeBin, [...originalArgs, "--effort", "high"], {
     stdio: "inherit",
     cwd: process.cwd(),
-    env: { ...process.env, CLAUDE_CODE_TEAMMATE_COMMAND: "" }, // bridge 재귀 방지
+    env: {
+      ...process.env,
+      CLAUDE_CODE_TEAMMATE_COMMAND: "",  // bridge 재귀 방지
+      CLAUDE_CODE_SKIP_TRUST: "1",       // trust 대화상자 건너뛰기
+    },
   });
 
   const forwardSignal = (sig) => {
