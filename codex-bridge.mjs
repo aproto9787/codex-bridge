@@ -993,7 +993,7 @@ function getRandomPort() {
   });
 }
 
-function spawnNativeTuiPane(agentName, port) {
+function spawnNativeTuiPane(agentName, port, threadId) {
   if (!process.env.TMUX) {
     log("NATIVE-TUI", "not in tmux, cannot spawn native TUI pane");
     return null;
@@ -1005,15 +1005,20 @@ function spawnNativeTuiPane(agentName, port) {
     return null;
   }
 
-  const cmd = `${JSON.stringify(codexBin)} --remote ws://127.0.0.1:${port} --enable tui_app_server`;
+  // threadId가 있으면 resume으로 같은 thread에 붙음 (핵심!)
+  const remoteArg = `--remote ws://127.0.0.1:${port}`;
+  const cmd = threadId
+    ? `${JSON.stringify(codexBin)} resume ${threadId} ${remoteArg} --enable tui_app_server`
+    : `${JSON.stringify(codexBin)} ${remoteArg} --enable tui_app_server`;
   const myPane = process.env.TMUX_PANE;
 
   if (myPane) {
-    // 실제 TeamCreate: 워커 pane을 split → bridge 축소, TUI가 메인
+    // 워커 pane을 split → bridge 축소, TUI가 메인
     const splitResult = spawnSync("tmux", [
       "split-window", "-h",          // 수평 분할 (좌: bridge, 우: TUI)
       "-t", myPane,                  // 자기 pane 기준으로 split
       "-l", "85%",                   // TUI가 85% 차지
+      "-d",                          // 포커스를 빼앗지 않음 (오케 유지)
       "-P", "-F", "#{pane_id}",
       cmd,
     ], { encoding: "utf8", timeout: 5000 });
@@ -1021,7 +1026,7 @@ function spawnNativeTuiPane(agentName, port) {
     if (splitResult.status === 0) {
       const paneId = (splitResult.stdout || "").trim();
       nativeTuiPaneId = paneId;
-      log("NATIVE-TUI", `TUI pane split from ${myPane}: ${paneId} (ws://127.0.0.1:${port})`);
+      log("NATIVE-TUI", `TUI pane split from ${myPane}: ${paneId} (ws://127.0.0.1:${port}, thread=${threadId || "new"})`);
 
       // TUI pane이 죽어도 유지
       try {
@@ -2076,9 +2081,9 @@ async function pollLoop(config) {
     wsPort: wsPort,
     onStatus: (status) => {
       emitStatus(status);
-      // 네이티브 TUI: session ready 시점에 tmux pane 스폰
+      // 네이티브 TUI: session ready 시점에 tmux pane 스폰 (threadId로 resume)
       if (config._useNativeTui && status === "session ready" && !nativeTuiPaneId && wsPort) {
-        spawnNativeTuiPane(config.agentName, wsPort);
+        spawnNativeTuiPane(config.agentName, wsPort, session.threadId);
       }
     },
     onError: (tag, msg) => {
