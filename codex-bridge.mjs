@@ -86,6 +86,7 @@ let nativeTuiPaneId = null;       // 네이티브 Codex TUI pane ID (cleanup용)
 let nativeTuiSessionName = null;  // 네이티브 TUI tmux 세션 이름 (cleanup용)
 let wsPort = null;                // WebSocket app-server 포트 (네이티브 TUI용)
 let ansiFallbackLogged = false;   // ANSI fallback 전환 로그 1회 제한
+let nativeTuiSpawning = false;    // TUI spawn 진행 중 플래그
 
 // ─── Inline mkdir-based Lock (proper-lockfile compatible) ───
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -786,7 +787,7 @@ function renderNotification(method, params) {
       viewerProc = null;
     }
   }
-  if (!ansiFallbackLogged) {
+  if (!ansiFallbackLogged && !nativeTuiSpawning) {
     ansiFallbackLogged = true;
     log("TUI", "falling back to ANSI renderer (viewer/native TUI unavailable)");
   }
@@ -1005,6 +1006,10 @@ let nativeTuiChild = null; // 네이티브 TUI child process
 function attachNativeTuiChildHandlers(child) {
   child.on("close", (code) => {
     log("NATIVE-TUI", `TUI exited (code=${code})`);
+    if (nativeTuiPaneId) {
+      log("NATIVE-TUI", "post-ready crash detected, reverting to ANSI renderer");
+      ansiFallbackLogged = false;
+    }
     nativeTuiChild = null;
     nativeTuiPaneId = null;
   });
@@ -1059,6 +1064,9 @@ async function spawnNativeTuiInPlace(agentName, port, threadId) {
     return null;
   }
 
+  // app-server가 세션 파일을 디스크에 쓸 시간 확보
+  await new Promise(r => setTimeout(r, 200));
+
   // TUI를 bridge와 같은 pane에서 실행 (stdio: "inherit" → 터미널 공유)
   // bridge는 뒤에서 IPC만 처리, TUI가 화면을 차지
   const args = threadId
@@ -1071,9 +1079,13 @@ async function spawnNativeTuiInPlace(agentName, port, threadId) {
     log("NATIVE-TUI", `spawning in-place (attempt ${attempt}/${maxRetries + 1}): ${codexBin} ${args.join(" ")}`);
 
     const child = spawn(codexBin, args, {
-      stdio: "inherit",  // TUI가 bridge의 터미널을 직접 사용
+      stdio: ["inherit", "inherit", "pipe"],  // stderr만 캡처
       cwd: process.cwd(),
       env: { ...process.env },
+    });
+    child.stderr.on("data", (chunk) => {
+      const text = String(chunk).trim();
+      if (text) log("NATIVE-TUI-STDERR", text);
     });
 
     nativeTuiChild = child;
@@ -1684,6 +1696,9 @@ class AppServerSession {
       ws.on("close", () => {
         log("WS", "WebSocket closed");
         this.ws = null;
+        if (!shuttingDown) {
+          this.handleFatal(new Error("WebSocket closed unexpectedly"));
+        }
       });
       ws.on("error", (err) => log("WS", `error: ${err.message}`));
       log("WS", "connected to app-server");
@@ -2162,7 +2177,8 @@ async function pollLoop(config) {
       // 네이티브 TUI: session ready 시점에 tmux pane 스폰 (threadId로 resume)
       if (config._useNativeTui && status === "session ready" && !nativeTuiPaneId && wsPort) {
         spawnNativeTuiInPlace(config.agentName, wsPort, session.threadId)
-          .catch((err) => log("NATIVE-TUI", `spawn error: ${err.message}`));
+          .catch((err) => log("NATIVE-TUI", `spawn error: ${err.message}`))
+          .finally(() => { nativeTuiSpawning = false; });
       }
     },
     onError: (tag, msg) => {
@@ -2565,6 +2581,26 @@ function passthroughToClaude() {
     || spawnSync("which", ["claude"], { encoding: "utf8", timeout: 3000 }).stdout?.trim()
     || join(homedir(), ".local", "bin", "claude");
   const originalArgs = process.argv.slice(2);
+
+  // bridge 전용 플래그 필터링 (Claude CLI에 전달하면 안 되는 것들)
+  // 주의: --agent-name, --team-name, --agent-id, --parent-session-id, --agent-type은
+  // Claude Code 팀 시스템이 사용하므로 필터링하면 안 됨
+  const BRIDGE_ONLY_FLAGS = new Set([
+    "--agent-color"
+  ]);
+  const filteredArgs = [];
+  for (let i = 0; i < originalArgs.length; i++) {
+    if (BRIDGE_ONLY_FLAGS.has(originalArgs[i])) {
+      i++; // 값도 스킵
+      continue;
+    }
+    if (originalArgs[i] === "--effort") {
+      i++; // 기존 --effort 값 스킵 (아래에서 재추가)
+      continue;
+    }
+    filteredArgs.push(originalArgs[i]);
+  }
+
   log("PASSTHROUGH", `Forwarding to Claude Code: ${claudeBin}`);
 
   // 스폰 후 리더 pane으로 포커스 자동 복원
@@ -2572,7 +2608,7 @@ function passthroughToClaude() {
     spawn("tmux", ["select-pane", "-l"], { stdio: "ignore", detached: true }).unref();
   } catch { /* tmux 없는 환경에서는 무시 */ }
 
-  const child = spawn(claudeBin, [...originalArgs, "--effort", "high"], {
+  const child = spawn(claudeBin, [...filteredArgs, "--effort", "high"], {
     stdio: "inherit",
     cwd: process.cwd(),
     env: {
@@ -2667,6 +2703,7 @@ async function main() {
     log("NATIVE-TUI", `WebSocket mode enabled, port=${wsPort}, bin=${nativeTuiBin}`);
     // 네이티브 TUI pane은 app-server ready 후 스폰 (pollLoop 진입 전)
     config._useNativeTui = true;
+    nativeTuiSpawning = true;   // session ready 전 notification에서도 ANSI fallback 억제
   }
 
   // TUI 뷰어: 기본 비활성 (ANSI fallback)
