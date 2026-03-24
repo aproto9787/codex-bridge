@@ -85,6 +85,7 @@ let _borderAgentName = null; // border-status용 에이전트 이름 (main에서
 let nativeTuiPaneId = null;       // 네이티브 Codex TUI pane ID (cleanup용)
 let nativeTuiSessionName = null;  // 네이티브 TUI tmux 세션 이름 (cleanup용)
 let wsPort = null;                // WebSocket app-server 포트 (네이티브 TUI용)
+let ansiFallbackLogged = false;   // ANSI fallback 전환 로그 1회 제한
 
 // ─── Inline mkdir-based Lock (proper-lockfile compatible) ───
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -785,6 +786,10 @@ function renderNotification(method, params) {
       viewerProc = null;
     }
   }
+  if (!ansiFallbackLogged) {
+    ansiFallbackLogged = true;
+    log("TUI", "falling back to ANSI renderer (viewer/native TUI unavailable)");
+  }
   renderNotificationANSI(method, params);
 }
 
@@ -923,30 +928,64 @@ function spawnTuiTmuxPane(agentName) {
 
 function findCodexAlphaBin() {
   // 1. CODEX_ALPHA_BIN env
-  if (process.env.CODEX_ALPHA_BIN && existsSync(process.env.CODEX_ALPHA_BIN)) {
-    return process.env.CODEX_ALPHA_BIN;
+  if (process.env.CODEX_ALPHA_BIN) {
+    log("TUI-DETECT", `checking CODEX_ALPHA_BIN=${process.env.CODEX_ALPHA_BIN}`);
+    if (existsSync(process.env.CODEX_ALPHA_BIN)) {
+      log("TUI-DETECT", `using CODEX_ALPHA_BIN: ${process.env.CODEX_ALPHA_BIN}`);
+      return process.env.CODEX_ALPHA_BIN;
+    }
+    log("TUI-DETECT", `CODEX_ALPHA_BIN not found: ${process.env.CODEX_ALPHA_BIN}`);
+  } else {
+    log("TUI-DETECT", "CODEX_ALPHA_BIN not set");
   }
   // 2. Known paths (codex-alpha, codex-next)
+  log("TUI-DETECT", "checking known native TUI paths");
   const knownPaths = [
     join(homedir(), ".local", "bin", "codex-alpha"),
     join(homedir(), ".local", "bin", "codex-next"),
     "/usr/local/bin/codex-alpha",
   ];
   for (const p of knownPaths) {
-    if (existsSync(p)) return p;
+    if (existsSync(p)) {
+      log("TUI-DETECT", `found native TUI binary at ${p}`);
+      return p;
+    }
   }
-  // 3. 기본 codex가 0.117+이면 그대로 사용
+  log("TUI-DETECT", "known native TUI paths not found");
+  // 3. PATH lookup (codex-alpha, codex-next)
+  log("TUI-DETECT", "searching PATH for codex-alpha/codex-next");
+  for (const binName of ["codex-alpha", "codex-next"]) {
+    try {
+      const result = spawnSync("which", [binName], { encoding: "utf8", timeout: 3000 });
+      const p = (result.stdout || "").trim();
+      if (p && existsSync(p)) {
+        log("TUI-DETECT", `found ${binName} on PATH: ${p}`);
+        return p;
+      }
+    } catch (err) {
+      log("TUI-DETECT", `PATH lookup failed for ${binName}: ${err.message}`);
+    }
+  }
+  log("TUI-DETECT", "codex-alpha/codex-next not found on PATH");
+  // 4. 기본 codex가 0.117+이면 그대로 사용
   const ver = getCodexVersion();
+  log("TUI-DETECT", `checking codex native TUI support (version=${ver || "unknown"})`);
   if (ver) {
     const m = ver.match(/^(\d+)\.(\d+)\.(\d+)/);
     if (m && (Number(m[1]) > 0 || Number(m[2]) >= 117)) {
       try {
         const r = spawnSync("which", ["codex"], { encoding: "utf8", timeout: 3000 });
         const p = (r.stdout || "").trim();
-        if (p && existsSync(p)) return p;
-      } catch {}
+        if (p && existsSync(p)) {
+          log("TUI-DETECT", `using codex 0.117+ binary: ${p}`);
+          return p;
+        }
+      } catch (err) {
+        log("TUI-DETECT", `PATH lookup failed for codex: ${err.message}`);
+      }
     }
   }
+  log("TUI-DETECT", "no native TUI-compatible codex binary found");
   return null;
 }
 
@@ -963,30 +1002,7 @@ function getRandomPort() {
 
 let nativeTuiChild = null; // 네이티브 TUI child process
 
-function spawnNativeTuiInPlace(agentName, port, threadId) {
-  const codexBin = findCodexAlphaBin();
-  if (!codexBin) {
-    log("NATIVE-TUI", "codex-alpha binary not found, skipping native TUI");
-    return null;
-  }
-
-  // TUI를 bridge와 같은 pane에서 실행 (stdio: "inherit" → 터미널 공유)
-  // bridge는 뒤에서 IPC만 처리, TUI가 화면을 차지
-  const args = threadId
-    ? ["resume", threadId, "--remote", `ws://127.0.0.1:${port}`, "--enable", "tui_app_server"]
-    : ["--remote", `ws://127.0.0.1:${port}`, "--enable", "tui_app_server"];
-
-  log("NATIVE-TUI", `spawning in-place: ${codexBin} ${args.join(" ")}`);
-
-  const child = spawn(codexBin, args, {
-    stdio: "inherit",  // TUI가 bridge의 터미널을 직접 사용
-    cwd: process.cwd(),
-    env: { ...process.env },
-  });
-
-  nativeTuiChild = child;
-  nativeTuiPaneId = "in-place"; // pane 분리 없음 표시
-
+function attachNativeTuiChildHandlers(child) {
   child.on("close", (code) => {
     log("NATIVE-TUI", `TUI exited (code=${code})`);
     nativeTuiChild = null;
@@ -998,18 +1014,98 @@ function spawnNativeTuiInPlace(agentName, port, threadId) {
     nativeTuiChild = null;
     nativeTuiPaneId = null;
   });
+}
 
-  // pane 제목을 에이전트 이름으로 설정
-  if (process.env.TMUX) {
-    try {
-      spawnSync("tmux", ["select-pane", "-T", `${agentName} [codex-tui]`], { stdio: "ignore", timeout: 2000 });
-      // 포커스를 오케로 복원
-      spawnSync("tmux", ["select-pane", "-l"], { stdio: "ignore", timeout: 2000 });
-    } catch {}
+function waitForNativeTuiReady(child, timeoutMs = 500) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.removeListener("close", onClose);
+      child.removeListener("error", onError);
+    };
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+    const onClose = (code, signal) => {
+      finish(reject, new Error(`early exit (code=${code}, signal=${signal || "none"})`));
+    };
+    const onError = (err) => {
+      finish(reject, err);
+    };
+    const timer = setTimeout(() => {
+      finish(resolve);
+    }, timeoutMs);
+    child.on("close", onClose);
+    child.on("error", onError);
+  });
+}
+
+async function spawnNativeTuiInPlace(agentName, port, threadId) {
+  let codexBin = findCodexAlphaBin();
+  if (!codexBin) {
+    const ver = getCodexVersion();
+    const m = ver && ver.match(/^(\d+)\.(\d+)\.(\d+)/);
+    if (m && (Number(m[1]) > 0 || Number(m[2]) >= 117)) {
+      codexBin = "codex";
+      log("NATIVE-TUI", "native TUI supported by codex, falling back to plain codex binary");
+    }
+  }
+  if (!codexBin) {
+    log("NATIVE-TUI", "native TUI binary not found, skipping native TUI");
+    return null;
   }
 
-  log("NATIVE-TUI", `TUI running in-place (pid=${child.pid}, thread=${threadId || "new"})`);
-  return "in-place";
+  // TUI를 bridge와 같은 pane에서 실행 (stdio: "inherit" → 터미널 공유)
+  // bridge는 뒤에서 IPC만 처리, TUI가 화면을 차지
+  const args = threadId
+    ? ["resume", threadId, "--remote", `ws://127.0.0.1:${port}`, "--enable", "tui_app_server"]
+    : ["--remote", `ws://127.0.0.1:${port}`, "--enable", "tui_app_server"];
+
+  const maxRetries = 2;
+  for (let retry = 0; retry <= maxRetries; retry++) {
+    const attempt = retry + 1;
+    log("NATIVE-TUI", `spawning in-place (attempt ${attempt}/${maxRetries + 1}): ${codexBin} ${args.join(" ")}`);
+
+    const child = spawn(codexBin, args, {
+      stdio: "inherit",  // TUI가 bridge의 터미널을 직접 사용
+      cwd: process.cwd(),
+      env: { ...process.env },
+    });
+
+    nativeTuiChild = child;
+    nativeTuiPaneId = "in-place"; // pane 분리 없음 표시
+
+    // pane 제목을 에이전트 이름으로 설정
+    if (process.env.TMUX) {
+      try {
+        spawnSync("tmux", ["select-pane", "-T", `${agentName} [codex-tui]`], { stdio: "ignore", timeout: 2000 });
+        // 포커스를 오케로 복원
+        spawnSync("tmux", ["select-pane", "-l"], { stdio: "ignore", timeout: 2000 });
+      } catch {}
+    }
+
+    try {
+      await waitForNativeTuiReady(child, 500);
+      attachNativeTuiChildHandlers(child);
+      log("NATIVE-TUI", `TUI running in-place (pid=${child.pid}, thread=${threadId || "new"})`);
+      return "in-place";
+    } catch (err) {
+      nativeTuiChild = null;
+      nativeTuiPaneId = null;
+      log("NATIVE-TUI", `spawn attempt ${attempt}/${maxRetries + 1} failed: ${err.message}`);
+      if (retry < maxRetries) {
+        await sleep(500);
+        continue;
+      }
+      log("NATIVE-TUI", "spawn failed after retries, falling back to ANSI");
+      return null;
+    }
+  }
+  return null;
 }
 
 function closeNativeTuiPane() {
@@ -1536,12 +1632,43 @@ class AppServerSession {
       await this.waitForReady(this.wsPort);
 
       const { default: WebSocket } = await import("ws");
-      const ws = new WebSocket(wsUrl);
-      await new Promise((resolve, reject) => {
-        ws.on("open", resolve);
-        ws.on("error", reject);
-        setTimeout(() => reject(new Error("WebSocket connect timeout")), 10000);
-      });
+      let ws = null;
+      let lastWsError = null;
+      for (let retry = 0; retry <= 3; retry++) {
+        try {
+          ws = await new Promise((resolve, reject) => {
+            const socket = new WebSocket(wsUrl);
+            const cleanup = () => {
+              clearTimeout(timer);
+              socket.removeListener("open", onOpen);
+              socket.removeListener("error", onError);
+            };
+            const onOpen = () => {
+              cleanup();
+              resolve(socket);
+            };
+            const onError = (err) => {
+              cleanup();
+              try { socket.close(); } catch {}
+              reject(err);
+            };
+            const timer = setTimeout(() => {
+              cleanup();
+              try { socket.close(); } catch {}
+              reject(new Error("WebSocket connect timeout"));
+            }, 10000);
+            socket.on("open", onOpen);
+            socket.on("error", onError);
+          });
+          break;
+        } catch (err) {
+          lastWsError = err;
+          if (retry >= 3) break;
+          log("WS", `retry ${retry + 1}/3...`);
+          await sleep(1000);
+        }
+      }
+      if (!ws) throw lastWsError || new Error("WebSocket connect failed");
       this.ws = ws;
       ws.on("message", (data) => {
         const text = String(data);
@@ -2034,7 +2161,8 @@ async function pollLoop(config) {
       emitStatus(status);
       // 네이티브 TUI: session ready 시점에 tmux pane 스폰 (threadId로 resume)
       if (config._useNativeTui && status === "session ready" && !nativeTuiPaneId && wsPort) {
-        spawnNativeTuiInPlace(config.agentName, wsPort, session.threadId);
+        spawnNativeTuiInPlace(config.agentName, wsPort, session.threadId)
+          .catch((err) => log("NATIVE-TUI", `spawn error: ${err.message}`));
       }
     },
     onError: (tag, msg) => {
@@ -2490,6 +2618,9 @@ async function main() {
     process.exit(1);
   }
 
+  // ANSI/TUI 탐지 로그도 파일에 남기도록 최대한 초기에 초기화
+  initLogFile(config.agentName);
+
   // 라우팅: codex-* → 항상 Codex, claude-* → Claude, 그 외 → 모델명으로 판단
   if (!config.agentName.startsWith("codex-")) {
     const modelLower = typeof config.model === "string" ? config.model.toLowerCase() : "";
@@ -2517,18 +2648,20 @@ async function main() {
   // 2. codex 0.117+ → 자동 활성화
   // 3. codex-alpha 바이너리 존재 → 자동 활성화
   // 4. CODEX_BRIDGE_NATIVE_TUI=0 → 강제 비활성화
-  const nativeTuiBin = findCodexAlphaBin();
+  let nativeTuiBin = findCodexAlphaBin();
   const codexVersion = getCodexVersion();
-  const codexSupportsNativeTui = codexVersion && (() => {
+  const codexSupportsNativeTui = !!(codexVersion && (() => {
     const m = codexVersion.match(/^(\d+)\.(\d+)\.(\d+)/);
     if (!m) return false;
     const [, major, minor] = m.map(Number);
     return major > 0 || minor >= 117;
-  })();
-  const useNativeTui = process.env.CODEX_BRIDGE_NATIVE_TUI !== "0"
-    && process.env.TMUX
-    && (process.env.CODEX_BRIDGE_NATIVE_TUI === "1" || codexSupportsNativeTui || nativeTuiBin);
-  log("TUI-DETECT", `codex=${codexVersion || "?"}, alpha=${nativeTuiBin || "none"}, native=${useNativeTui}`);
+  })());
+  if (!nativeTuiBin && codexSupportsNativeTui) {
+    nativeTuiBin = "codex";
+    log("TUI-DETECT", "codex 0.117+ detected without dedicated alpha/next bin, using codex fallback");
+  }
+  const useNativeTui = process.env.CODEX_BRIDGE_NATIVE_TUI !== "0" && (!!nativeTuiBin || codexSupportsNativeTui);
+  log("TUI-DETECT", `codex=${codexVersion || "?"}, alpha=${nativeTuiBin || "none"}, supported=${codexSupportsNativeTui}, native=${useNativeTui}`);
   if (useNativeTui) {
     wsPort = await getRandomPort();
     log("NATIVE-TUI", `WebSocket mode enabled, port=${wsPort}, bin=${nativeTuiBin}`);
@@ -2556,9 +2689,6 @@ async function main() {
       } catch {}
     }
   }
-
-  // ANSI 출력이 stderr로 가므로 항상 로그 파일로 분리
-  initLogFile(config.agentName);
 
   setupSignalHandlers(config);
   await pollLoop(config);
