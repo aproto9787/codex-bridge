@@ -25,6 +25,7 @@ Claude Code's `TeamCreate` system can spawn multiple AI agents that collaborate 
 - **2-stage result storage** — Full output saved to `results/` directory; only a preview (500 chars) goes to the inbox, keeping context windows lean
 - **Atomic file locking** — `mkdir`-based locks with stale detection for safe concurrent reads/writes
 - **TUI viewer** — Optional tmux pane with real-time streaming (ANSI fallback by default)
+- **Live steering** — Injects new messages into active turns via `turn/steer` without restarting, with pending queue for failed steers
 - **Auto base instructions** — Injects worker behavior rules (scope control, sub-agent policies, process protection) via `thread/start`
 - **Graceful shutdown** — Coordinated shutdown with pane cleanup and leader notification
 
@@ -88,15 +89,18 @@ node codex-bridge.mjs --agent-name codex-worker --team-name my-team
 | `CODEX_TUI_BIN` | Path to patched codex-tui binary | Search PATH → ANSI fallback |
 | `CLAUDE_BIN` | Path to Claude Code binary | `which claude` |
 | `CODEX_BRIDGE_TUI` | Set to `1` to enable TUI viewer pane | `0` (ANSI fallback) |
+| `CODEX_BRIDGE_NATIVE_TUI` | Set to `0` to disable native TUI | Auto-detect |
+| `CODEX_ALPHA_BIN` | Path to `codex-alpha` binary | Auto-discover |
+| `CODEX_BRIDGE_VERBOSE` | Set to `1` for verbose logging | `0` |
 
 ## Architecture
 
 ```
-codex-bridge.mjs (single file, ~2300 lines)
+codex-bridge.mjs (single file, ~2750 lines)
 ├── CLI arg parser & routing logic
 ├── File-based IPC (inbox/outbox with fs.watch)
 ├── Leader outbox batcher (micro-batch writes)
-├── Codex App Server session (WebSocket JSON-RPC)
+├── Codex App Server session (stdio JSON-RPC; WebSocket when native TUI)
 ├── Claude Code passthrough (stdio forwarding)
 ├── ANSI renderer (compact/full modes)
 ├── TUI viewer (tmux pane integration)
@@ -104,13 +108,13 @@ codex-bridge.mjs (single file, ~2300 lines)
 └── Graceful shutdown & signal handling
 ```
 
-The bridge is **zero-dependency for core functionality** — only `ink` and `react` are used for the optional TUI viewer.
+The bridge uses mostly Node.js built-ins for core functionality — `ink` and `react` for the optional TUI viewer, and `ws` (via transitive dependency) for WebSocket mode.
 
 ## How team communication works
 
 1. **Leader** writes a task to the worker's inbox (`~/.claude/teams/<team>/inboxes/<worker>.json`)
 2. **Bridge** detects the file change via `fs.watch` (with polling fallback)
-3. **Bridge** sends the prompt to Codex App Server via JSON-RPC over stdio
+3. **Bridge** sends the prompt to Codex App Server via JSON-RPC over stdio (WebSocket in native TUI mode)
 4. **Codex** processes the task, streaming events back through the bridge
 5. **Bridge** collects the full response, saves it to `results/`, and writes a preview to the leader's inbox
 6. **Leader** reads the result and continues orchestration

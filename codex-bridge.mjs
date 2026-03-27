@@ -990,6 +990,40 @@ function findCodexAlphaBin() {
   return null;
 }
 
+function formatSessionPathPart(value) {
+  return String(value).padStart(2, "0");
+}
+
+function getCodexSessionFilePath(threadId) {
+  if (!threadId) return null;
+  const compact = String(threadId).replace(/-/g, "");
+  if (!/^[0-9a-f]{12,}$/i.test(compact)) return null;
+  try {
+    const startedAt = new Date(Number(BigInt(`0x${compact.slice(0, 12)}`)));
+    if (Number.isNaN(startedAt.getTime())) return null;
+    const yyyy = String(startedAt.getFullYear());
+    const mm = formatSessionPathPart(startedAt.getMonth() + 1);
+    const dd = formatSessionPathPart(startedAt.getDate());
+    const hh = formatSessionPathPart(startedAt.getHours());
+    const min = formatSessionPathPart(startedAt.getMinutes());
+    const ss = formatSessionPathPart(startedAt.getSeconds());
+    const fileName = `rollout-${yyyy}-${mm}-${dd}T${hh}-${min}-${ss}-${threadId}.jsonl`;
+    return join(homedir(), ".codex", "sessions", yyyy, mm, dd, fileName);
+  } catch {
+    return null;
+  }
+}
+
+async function waitForFile(filePath, timeoutMs = 5000, intervalMs = 100) {
+  if (!filePath) return false;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(filePath)) return true;
+    await sleep(Math.min(intervalMs, Math.max(1, deadline - Date.now())));
+  }
+  return existsSync(filePath);
+}
+
 function getRandomPort() {
   return new Promise((resolve, reject) => {
     const srv = createServer();
@@ -1003,21 +1037,35 @@ function getRandomPort() {
 
 let nativeTuiChild = null; // 네이티브 TUI child process
 
-function attachNativeTuiChildHandlers(child) {
-  child.on("close", (code) => {
-    log("NATIVE-TUI", `TUI exited (code=${code})`);
+function attachNativeTuiChildHandlers(child, onAbnormalExit = null) {
+  let recoveryTriggered = false;
+  const triggerRecovery = (info) => {
+    if (!onAbnormalExit || recoveryTriggered) return;
+    if (child._bridgeClosing || shuttingDown) return;
+    recoveryTriggered = true;
+    Promise.resolve(onAbnormalExit(info)).catch((err) => {
+      log("NATIVE-TUI", `recovery error: ${err.message}`);
+    });
+  };
+
+  child.on("close", (code, signal) => {
+    log("NATIVE-TUI", `TUI exited (code=${code}, signal=${signal || "none"})`);
     if (nativeTuiPaneId) {
       log("NATIVE-TUI", "post-ready crash detected, reverting to ANSI renderer");
       ansiFallbackLogged = false;
     }
     nativeTuiChild = null;
     nativeTuiPaneId = null;
+    if (signal || (typeof code === "number" && code !== 0)) {
+      triggerRecovery({ child, code, signal });
+    }
   });
 
   child.on("error", (err) => {
     log("NATIVE-TUI", `TUI error: ${err.message}`);
     nativeTuiChild = null;
     nativeTuiPaneId = null;
+    triggerRecovery({ child, error: err });
   });
 }
 
@@ -1049,7 +1097,7 @@ function waitForNativeTuiReady(child, timeoutMs = 500) {
   });
 }
 
-async function spawnNativeTuiInPlace(agentName, port, threadId) {
+async function spawnNativeTuiInPlace(agentName, port, threadId, sessionFilePath = null, onAbnormalExit = null) {
   let codexBin = findCodexAlphaBin();
   if (!codexBin) {
     const ver = getCodexVersion();
@@ -1064,8 +1112,16 @@ async function spawnNativeTuiInPlace(agentName, port, threadId) {
     return null;
   }
 
-  // app-server가 세션 파일을 디스크에 쓸 시간 확보
-  await new Promise(r => setTimeout(r, 200));
+  const resolvedSessionFilePath = sessionFilePath || getCodexSessionFilePath(threadId);
+  if (threadId && resolvedSessionFilePath && !existsSync(resolvedSessionFilePath)) {
+    log("NATIVE-TUI", `waiting for session file: ${resolvedSessionFilePath}`);
+    const sessionFileReady = await waitForFile(resolvedSessionFilePath, 5000, 100);
+    if (sessionFileReady) {
+      log("NATIVE-TUI", `session file detected: ${resolvedSessionFilePath}`);
+    } else {
+      log("NATIVE-TUI", `session file wait timed out after 5000ms, resuming anyway: ${resolvedSessionFilePath}`);
+    }
+  }
 
   // TUI를 bridge와 같은 pane에서 실행 (stdio: "inherit" → 터미널 공유)
   // bridge는 뒤에서 IPC만 처리, TUI가 화면을 차지
@@ -1102,7 +1158,7 @@ async function spawnNativeTuiInPlace(agentName, port, threadId) {
 
     try {
       await waitForNativeTuiReady(child, 500);
-      attachNativeTuiChildHandlers(child);
+      attachNativeTuiChildHandlers(child, onAbnormalExit);
       log("NATIVE-TUI", `TUI running in-place (pid=${child.pid}, thread=${threadId || "new"})`);
       return "in-place";
     } catch (err) {
@@ -1121,8 +1177,11 @@ async function spawnNativeTuiInPlace(agentName, port, threadId) {
 }
 
 function closeNativeTuiPane() {
-  if (nativeTuiChild && !nativeTuiChild.killed) {
-    nativeTuiChild.kill("SIGTERM");
+  if (nativeTuiChild) {
+    nativeTuiChild._bridgeClosing = true;
+    if (!nativeTuiChild.killed) {
+      nativeTuiChild.kill("SIGTERM");
+    }
     nativeTuiChild = null;
   }
   nativeTuiPaneId = null;
@@ -1583,6 +1642,7 @@ class AppServerSession {
     this.ws = null;       // WebSocket 연결 (ws 모드)
     this.child = null;
     this.threadId = null;
+    this.sessionFilePath = null;
     this.activeTurnId = null;
     this.acceptTurnStarted = false;
     this.currentTurn = null;
@@ -1590,6 +1650,7 @@ class AppServerSession {
     this.nextId = 1;
     this.stdoutBuffer = "";
     this.startPromise = null;
+    this.wsRestartPromise = null;
     this.closed = false;
     // lifecycle 콜백
     this.onStatus = opts.onStatus || null;
@@ -1635,8 +1696,8 @@ class AppServerSession {
         const text = String(chunk).trim();
         if (text) log("APP-SERVER", text);
       });
-      child.on("close", (code, signal) => this.handleClose(code, signal));
-      child.on("error", (err) => this.handleFatal(err));
+      child.on("close", (code, signal) => this.handleClose(child, code, signal));
+      child.on("error", (err) => this.handleFatal(err, child));
 
       // readyz 대기 후 WebSocket 연결
       const wsUrl = `ws://127.0.0.1:${this.wsPort}`;
@@ -1682,7 +1743,14 @@ class AppServerSession {
       }
       if (!ws) throw lastWsError || new Error("WebSocket connect failed");
       this.ws = ws;
+      let wsErrorCloseTimer = null;
+      const clearWsErrorCloseTimer = () => {
+        if (!wsErrorCloseTimer) return;
+        clearTimeout(wsErrorCloseTimer);
+        wsErrorCloseTimer = null;
+      };
       ws.on("message", (data) => {
+        if (this.ws !== ws) return;
         const text = String(data);
         for (const line of text.split("\n")) {
           if (!line.trim()) continue;
@@ -1694,13 +1762,26 @@ class AppServerSession {
         }
       });
       ws.on("close", () => {
+        if (this.ws !== ws) return;
+        clearWsErrorCloseTimer();
         log("WS", "WebSocket closed");
         this.ws = null;
-        if (!shuttingDown) {
-          this.handleFatal(new Error("WebSocket closed unexpectedly"));
+        if (!shuttingDown && !this.closed) {
+          void this.restartAfterWsClose(new Error("WebSocket closed unexpectedly"));
         }
       });
-      ws.on("error", (err) => log("WS", `error: ${err.message}`));
+      ws.on("error", (err) => {
+        if (this.ws !== ws) return;
+        log("WS", `error: ${err.message}`);
+        if (wsErrorCloseTimer) return;
+        wsErrorCloseTimer = setTimeout(() => {
+          wsErrorCloseTimer = null;
+          if (this.ws !== ws) return;
+          log("WS", "error without close for 2000ms, forcing close");
+          try { ws.close(); } catch {}
+        }, 2000);
+        wsErrorCloseTimer.unref?.();
+      });
       log("WS", "connected to app-server");
     } else {
       // stdio 모드 (기존)
@@ -1713,8 +1794,8 @@ class AppServerSession {
           this.onError?.("APP-SERVER", text);
         }
       });
-      child.on("close", (code, signal) => this.handleClose(code, signal));
-      child.on("error", (err) => this.handleFatal(err));
+      child.on("close", (code, signal) => this.handleClose(child, code, signal));
+      child.on("error", (err) => this.handleFatal(err, child));
     }
 
     try {
@@ -1736,6 +1817,7 @@ class AppServerSession {
       if (!this.threadId) {
         throw new Error("thread/start returned no thread id");
       }
+      this.sessionFilePath = getCodexSessionFilePath(this.threadId);
 
       // Store REAL session info from app-server responses
       sessionInfo = {
@@ -1747,6 +1829,7 @@ class AppServerSession {
         sandbox: started?.sandbox || { type: "danger-full-access" },
         cwd: started?.cwd || this.cwd,
         reasoningEffort: started?.reasoningEffort || started?.reasoning_effort || null,
+        sessionFilePath: this.sessionFilePath,
       };
       log("SESSION", `real info: model=${sessionInfo.model} provider=${sessionInfo.modelProvider} ua=${sessionInfo.userAgent}`);
       this.onStatus?.("session ready");
@@ -1758,6 +1841,7 @@ class AppServerSession {
         this.child = null;
         currentChild = null;
         this.threadId = null;
+        this.sessionFilePath = null;
       }
       throw err;
     }
@@ -1778,6 +1862,132 @@ class AppServerSession {
       await sleep(200);
     }
     throw new Error(`app-server readyz timeout (${timeoutMs}ms)`);
+  }
+
+  async waitForChildExit(child, timeoutMs = 5000) {
+    if (!child) return;
+    if (child.exitCode !== null || child.signalCode !== null) return;
+
+    await new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        child.removeListener("exit", onExit);
+        child.removeListener("close", onClose);
+        child.removeListener("error", onError);
+      };
+      const onExit = () => {
+        cleanup();
+        resolve();
+      };
+      const onClose = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (err) => {
+        cleanup();
+        reject(err);
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`app-server exit timeout (${timeoutMs}ms)`));
+      }, timeoutMs);
+      child.once("exit", onExit);
+      child.once("close", onClose);
+      child.once("error", onError);
+    });
+  }
+
+  isWebSocketAlive() {
+    return !!(
+      this.useWebSocket &&
+      this.ws &&
+      this.ws.readyState === 1 &&
+      this.child &&
+      !this.child.killed &&
+      this.child.exitCode === null &&
+      this.child.signalCode === null
+    );
+  }
+
+  clearTransportState(sourceChild = null) {
+    const activeChild = sourceChild || this.child;
+    if (activeChild && currentChild === activeChild) currentChild = null;
+    if (activeChild && this.child === activeChild) this.child = null;
+    this.ws = null;
+    this.stdoutBuffer = "";
+  }
+
+  resetSessionState() {
+    this.acceptTurnStarted = false;
+    this.threadId = null;
+    this.sessionFilePath = null;
+    this.activeTurnId = null;
+    if (viewerProc) viewerProc._sessionSent = false;
+  }
+
+  failInflight(error) {
+    for (const { reject } of this.pending.values()) {
+      reject(error);
+    }
+    this.pending.clear();
+    if (this.currentTurn) {
+      this.currentTurn.reject(error);
+      this.currentTurn = null;
+    }
+    this.resetSessionState();
+  }
+
+  async restartAfterWsClose(err) {
+    if (!this.useWebSocket || this.closed || shuttingDown) return false;
+    if (this.wsRestartPromise) return this.wsRestartPromise;
+
+    let restartSucceeded = false;
+    this.wsRestartPromise = (async () => {
+      const oldChild = this.child;
+      const error = new Error(`Codex app-server error: ${err.message}`);
+      log("WS", "WebSocket closed unexpectedly, restarting app-server (1/1)");
+
+      nativeTuiSpawning = true;
+      closeNativeTuiPane();
+      this.ws = null;
+      this.stdoutBuffer = "";
+      this.failInflight(error);
+
+      if (oldChild && oldChild.exitCode === null && oldChild.signalCode === null) {
+        log("APP-SERVER", `stopping old child before restart (pid=${oldChild.pid ?? "unknown"})`);
+        oldChild.kill("SIGTERM");
+        try {
+          await this.waitForChildExit(oldChild, 5000);
+        } catch (waitErr) {
+          log("APP-SERVER", `${waitErr.message}; sending SIGKILL`);
+          try { oldChild.kill("SIGKILL"); } catch {}
+          await sleep(1000);
+        }
+      }
+      if (this.child === oldChild) this.child = null;
+      if (currentChild === oldChild) currentChild = null;
+
+      this.wsPort = await getRandomPort();
+      wsPort = this.wsPort;
+      log("WS", `restart with fresh port ${this.wsPort}`);
+
+      await this.ensureStarted();
+      restartSucceeded = true;
+      log("WS", "app-server restart succeeded");
+      return true;
+    })().catch((restartErr) => {
+      nativeTuiSpawning = false;
+      log("WS", `app-server restart failed: ${restartErr.message}`);
+      this.handleFatal(new Error(`WebSocket restart failed: ${restartErr.message}`));
+      return false;
+    }).finally(() => {
+      if (!restartSucceeded) {
+        this.clearTransportState();
+      }
+      this.wsRestartPromise = null;
+    });
+
+    return this.wsRestartPromise;
   }
 
   sendRaw(message) {
@@ -2008,44 +2218,21 @@ class AppServerSession {
     }
   }
 
-  handleFatal(err) {
+  handleFatal(err, sourceChild = null) {
+    if (sourceChild && this.child && sourceChild !== this.child) return;
+    this.clearTransportState(sourceChild);
     const error = new Error(`Codex app-server error: ${err.message}`);
-    for (const { reject } of this.pending.values()) {
-      reject(error);
-    }
-    this.pending.clear();
-    if (this.currentTurn) {
-      this.currentTurn.reject(error);
-      this.currentTurn = null;
-    }
-    this.acceptTurnStarted = false;
-    this.threadId = null;
-    this.activeTurnId = null;
-    if (viewerProc) viewerProc._sessionSent = false;
+    this.failInflight(error);
   }
 
-  handleClose(code, signal) {
-    currentChild = null;
-    this.child = null;
-    this.stdoutBuffer = "";
-    if (viewerProc) viewerProc._sessionSent = false;
+  handleClose(sourceChild, code, signal) {
+    if (sourceChild && this.child && sourceChild !== this.child) return;
+    this.clearTransportState(sourceChild);
     const reason = signal
       ? `Codex app-server exited via signal ${signal}`
       : `Codex app-server exited with code ${code}`;
     const error = new Error(reason);
-
-    for (const { reject } of this.pending.values()) {
-      reject(error);
-    }
-    this.pending.clear();
-
-    if (this.currentTurn) {
-      this.currentTurn.reject(error);
-      this.currentTurn = null;
-    }
-    this.acceptTurnStarted = false;
-    this.threadId = null;
-    this.activeTurnId = null;
+    this.failInflight(error);
   }
 
   async runTurn(prompt) {
@@ -2166,7 +2353,40 @@ async function pollLoop(config) {
     log("GOAL", `team goal: ${teamGoal.slice(0, 100)}`);
   }
 
-  const session = new AppServerSession({
+  let session = null;
+
+  const spawnNativeTuiForSession = () => {
+    if (!config._useNativeTui || !session) return Promise.resolve(null);
+    const port = session.wsPort || wsPort;
+    if (!port) return Promise.resolve(null);
+    nativeTuiSpawning = true;
+    return spawnNativeTuiInPlace(
+      config.agentName,
+      port,
+      session.threadId,
+      session.sessionFilePath,
+      handleNativeTuiAbnormalExit,
+    )
+      .catch((err) => {
+        log("NATIVE-TUI", `spawn error: ${err.message}`);
+        return null;
+      })
+      .finally(() => { nativeTuiSpawning = false; });
+  };
+
+  const handleNativeTuiAbnormalExit = async ({ code = null, signal = null, error = null } = {}) => {
+    if (!config._useNativeTui || !session || session.closed || shuttingDown) return;
+    const detail = error?.message || (signal ? `signal ${signal}` : `code ${code}`);
+    if (!session.isWebSocketAlive()) {
+      log("NATIVE-TUI", `abnormal exit with WS down (${detail}), restarting app-server`);
+      await session.restartAfterWsClose(new Error(`native TUI exited unexpectedly (${detail})`));
+      return;
+    }
+    log("NATIVE-TUI", `abnormal exit but WS is alive (${detail}), restarting TUI`);
+    await spawnNativeTuiForSession();
+  };
+
+  session = new AppServerSession({
     cwd: process.cwd(),
     effort: codexEffort,
     teamGoal,
@@ -2176,9 +2396,7 @@ async function pollLoop(config) {
       emitStatus(status);
       // 네이티브 TUI: session ready 시점에 tmux pane 스폰 (threadId로 resume)
       if (config._useNativeTui && status === "session ready" && !nativeTuiPaneId && wsPort) {
-        spawnNativeTuiInPlace(config.agentName, wsPort, session.threadId)
-          .catch((err) => log("NATIVE-TUI", `spawn error: ${err.message}`))
-          .finally(() => { nativeTuiSpawning = false; });
+        void spawnNativeTuiForSession();
       }
     },
     onError: (tag, msg) => {
