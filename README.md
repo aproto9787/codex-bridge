@@ -126,6 +126,50 @@ codex-bridge.mjs (single file, ~2750 lines)
 
 The bridge uses mostly Node.js built-ins for core functionality — `ink` and `react` for the optional TUI viewer, and `ws` (via transitive dependency) for WebSocket mode.
 
+## Configuration
+
+### Recommended CLAUDE.md setup
+
+Add the following to your `CLAUDE.md` to get the most out of codex-bridge:
+
+````markdown
+## Team Worker Naming
+
+When using TeamCreate with codex-bridge:
+
+- `codex-*` workers → routed to OpenAI Codex CLI
+- `claude-*` workers → routed to Claude Code
+
+### Worker role conventions
+| Name | Role |
+|---|---|
+| `codex-analyst` | Codebase exploration, research |
+| `codex-impl` | Implementation, bug fixes |
+| `codex-test` | Test writing, test execution |
+| `claude-reviewer` | Design judgment, complex review |
+| `claude-architect` | High-level decisions |
+````
+
+### Skill example
+
+You can define a custom skill to standardize your team setup.
+Create `.claude/skills/codex-team.md`:
+
+````markdown
+Spawn a mixed codex/claude team for the current task.
+
+1. TeamCreate with description of the goal
+2. Spawn workers:
+   - codex-analyst: explore and research
+   - codex-impl: implement
+   - claude-reviewer: review the result
+3. Assign tasks and wait for completion
+4. Run user-advocate verification
+5. TeamDelete
+````
+
+Then invoke with `/codex-team` in Claude Code.
+
 ## Usage Examples
 
 ### Basic: Codex-only team
