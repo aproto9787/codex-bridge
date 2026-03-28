@@ -2,6 +2,10 @@
 
 A bridge that integrates **OpenAI Codex CLI** as a native teammate within [Claude Code](https://docs.anthropic.com/en/docs/claude-code)'s team system — enabling **cross-model multi-agent collaboration** from a single orchestrator.
 
+## Screenshot
+
+![codex-bridge](codex-bridge.png)
+
 ## What it does
 
 Claude Code's `TeamCreate` system can spawn multiple AI agents that collaborate on tasks. By default, all teammates are Claude instances. **codex-bridge** lets you mix in Codex (GPT) workers alongside Claude workers, all managed by the same team leader.
