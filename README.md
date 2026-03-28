@@ -24,10 +24,16 @@ Claude Code's `TeamCreate` system can spawn multiple AI agents that collaborate 
 - **Leader outbox batching** — Micro-batches leader messages (50ms debounce) to reduce file I/O
 - **2-stage result storage** — Full output saved to `results/` directory; only a preview (500 chars) goes to the inbox, keeping context windows lean
 - **Atomic file locking** — `mkdir`-based locks with stale detection for safe concurrent reads/writes
-- **TUI viewer** — Optional tmux pane with real-time streaming (ANSI fallback by default)
+- **TUI viewer** — Optional tmux pane with real-time streaming (ANSI fallback by default), plus native Codex TUI when available
+- **Native TUI recovery** — If the in-place native TUI exits unexpectedly, the bridge restarts either the app-server + TUI or just the TUI depending on WebSocket health
+- **WebSocket recovery** — Unexpected WebSocket shutdown triggers a one-shot app-server restart on a fresh port, escalates from `SIGTERM` to `SIGKILL` if needed, and forces `error`-without-`close` into a close path so recovery actually runs
 - **Live steering** — Injects new messages into active turns via `turn/steer` without restarting, with pending queue for failed steers
-- **Auto base instructions** — Injects worker behavior rules (scope control, sub-agent policies, process protection) via `thread/start`
-- **Graceful shutdown** — Coordinated shutdown with pane cleanup and leader notification
+- **Goal-aware base instructions** — Injects worker behavior rules plus the team `config.json` `description` into `thread/start` base instructions
+- **Message deduplication** — Filters duplicate inbox deliveries with lightweight hash + TTL tracking before they can start or steer duplicate work
+- **Status and idle protocol** — Sends immediate task-accepted ACKs, throttled `[STATUS]` progress messages, and structured `idle_notification` updates for available/completed/error states
+- **Task auto-completion** — Marks the worker's own `in_progress` task files as `completed` before advertising availability again
+- **Config self-cleanup** — Removes the worker from team `config.json` during shutdown so stale members do not linger
+- **Graceful shutdown** — Coordinates turn interruption, pane cleanup, leader notification, and final config cleanup
 
 ## Requirements
 
@@ -52,7 +58,13 @@ Set the teammate command so Claude Code spawns workers through the bridge:
 export CLAUDE_CODE_TEAMMATE_COMMAND="$(pwd)/codex-bridge.mjs"
 ```
 
-Or add it to your shell profile for persistence.
+Or point it at the bundled launcher script:
+
+```bash
+export CLAUDE_CODE_TEAMMATE_COMMAND="$(pwd)/run-bridge.sh"
+```
+
+`run-bridge.sh` is a tiny wrapper that resolves the repository directory and executes `node codex-bridge.mjs "$@"`, which is convenient for shell profiles and direct debugging.
 
 ## Usage
 
@@ -103,9 +115,9 @@ codex-bridge.mjs (single file, ~2750 lines)
 ├── Codex App Server session (stdio JSON-RPC; WebSocket when native TUI)
 ├── Claude Code passthrough (stdio forwarding)
 ├── ANSI renderer (compact/full modes)
-├── TUI viewer (tmux pane integration)
-├── Task management (file-based status tracking)
-└── Graceful shutdown & signal handling
+├── TUI viewer + native TUI recovery
+├── Task management (dedup, idle protocol, auto-complete)
+└── Graceful shutdown, signal handling, and config self-cleanup
 ```
 
 The bridge uses mostly Node.js built-ins for core functionality — `ink` and `react` for the optional TUI viewer, and `ws` (via transitive dependency) for WebSocket mode.
@@ -113,11 +125,13 @@ The bridge uses mostly Node.js built-ins for core functionality — `ink` and `r
 ## How team communication works
 
 1. **Leader** writes a task to the worker's inbox (`~/.claude/teams/<team>/inboxes/<worker>.json`)
-2. **Bridge** detects the file change via `fs.watch` (with polling fallback)
-3. **Bridge** sends the prompt to Codex App Server via JSON-RPC over stdio (WebSocket in native TUI mode)
-4. **Codex** processes the task, streaming events back through the bridge
-5. **Bridge** collects the full response, saves it to `results/`, and writes a preview to the leader's inbox
-6. **Leader** reads the result and continues orchestration
+2. **Bridge** detects the file change via `fs.watch` (with polling fallback), ignores duplicate deliveries, and sends an immediate task-accepted ACK back to the leader
+3. **Bridge** starts or reuses a Codex App Server session, injecting worker rules and the team goal (`config.json` `description`) into `thread/start`
+4. **Codex** processes the task, streaming events back through the bridge over stdio or WebSocket
+5. **Bridge** emits `[STATUS]` progress updates while the task is running and can steer additional messages into the active turn
+6. **Bridge** collects the full response, saves it to `results/`, and writes only a preview to the leader's inbox
+7. **Bridge** auto-completes the worker's task file when possible, then sends a structured `idle_notification` describing whether it is available, completed, or failed
+8. **Leader** reads the result and continues orchestration
 
 ## License
 
