@@ -6,10 +6,10 @@
 
 Integrate OpenAI Codex CLI as a native teammate within [Claude Code](https://docs.anthropic.com/en/docs/claude-code)'s team system.
 
-![version](https://img.shields.io/badge/version-0.1.0-blue)
-![license](https://img.shields.io/badge/license-MIT-green)
-![platform](https://img.shields.io/badge/platform-linux-lightgrey)
-![node](https://img.shields.io/badge/node-%E2%89%A5%2018-brightgreen)
+[![version](https://img.shields.io/badge/version-0.1.0-blue)](https://github.com/aproto9787/codex-bridge/releases)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![platform](https://img.shields.io/badge/platform-linux-lightgrey)](#requirements)
+[![node](https://img.shields.io/badge/node-%E2%89%A5%2018-brightgreen)](https://nodejs.org)
 
 </div>
 
