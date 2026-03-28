@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// codex-bridge.mjs — Codex CLI를 Claude Code 네이티브 팀원으로 동작시키는 래퍼
-// zero-dependency (Node.js 내장 모듈만 사용)
+// codex-bridge.mjs — Wrapper that runs Codex CLI as a native Claude Code teammate
+// zero-dependency (uses only built-in Node.js modules)
 
 import { readFile, writeFile, mkdir, rmdir, rename, stat as fsStat } from "node:fs/promises";
 import { existsSync, readFileSync, createWriteStream, openSync, closeSync, unlinkSync, watch as fsWatch } from "node:fs";
@@ -14,59 +14,59 @@ const POLL_INTERVAL_MS = 500;
 const POLL_IDLE_MS = 2000;
 const POLL_ACTIVE_MS = 100;
 const POLL_FALLBACK_MS = 5000; // fs.watch fallback timeout
-const FLUSH_DEBOUNCE_MS = 50;  // leader outbox micro-batch 간격
+const FLUSH_DEBOUNCE_MS = 50;  // leader outbox micro-batch interval
 const SHUTDOWN_POLL_MS = 3000;
-const MAX_RESULT_BYTES = 5 * 1024 * 1024; // 5MB (파일 저장용)
-const PREVIEW_CHARS = 500; // inbox 미리보기 글자수
+const MAX_RESULT_BYTES = 5 * 1024 * 1024; // 5MB (for file storage)
+const PREVIEW_CHARS = 500; // inbox preview character count
 const TEAMS_BASE = join(homedir(), ".claude", "teams");
 const TASKS_BASE = join(homedir(), ".claude", "tasks");
 const LEADER_NAME = "team-lead";
 
-// ─── 팀 워커 기본 지시 (thread/start baseInstructions로 주입) ───
+// ─── Team worker base instructions (injected via thread/start baseInstructions) ───
 const BASE_INSTRUCTIONS_CORE = `\
-# 팀 워커 행동 규칙
+# Team Worker Behavior Rules
 
-## 기본
-- 한국어로 응답한다.
-- 간결하게 핵심만 전달한다. 장황한 설명, 불필요한 서론/결론 금지.
-- 부여받은 역할에 충실한다. 역할 범위를 벗어난 작업은 하지 않는다.
+## Basics
+- Respond in English.
+- Be concise. Deliver only the key points. No lengthy explanations or unnecessary introductions/conclusions.
+- Stay faithful to the assigned role. Do not do work outside your scope.
 
-## 결과물
-- 요청받은 것만 구현/분석한다. 요청하지 않은 추가 기능, 리팩토링, 추상화 금지.
-- 결과에 확신이 없는 부분은 명시적으로 표시한다.
-- 에러나 문제를 발견하면 숨기지 않고 보고한다.
+## Deliverables
+- Implement/analyze only what was requested. No unrequested extra features, refactoring, or abstraction.
+- Explicitly mark any parts you are not confident about.
+- If you find an error or issue, report it without hiding it.
 
-## 멀티에이전트 활용 (적극 분할 원칙)
-- **기본 자세: 의심스러우면 서브에이전트로 분할한다.**
-- 서브에이전트 스폰 기준: 파일 2개 이상 수정 OR 탐색 범위가 디렉토리 3개 이상.
-- 직접 처리 범위: **파일 1개, 단일 함수 수정만** 직접 처리한다.
-- 리더가 "서브에이전트로 병렬 처리하라"고 명시한 경우, 하위 작업을 최대한 독립적으로 분할하여 동시 실행한다.
-- 서브에이전트 수: 하위 작업 수만큼 스폰하되 **최대 4개**.
-- 서브에이전트에게도 동일한 행동 규칙(간결, 범위 준수, 과잉 금지)을 적용한다.
-- 서브에이전트 결과를 통합하여 하나의 응답으로 리더에게 보고한다.
-- 서브에이전트 실패 시 해당 하위 작업만 재시도하고, 성공한 작업은 유지한다.
+## Multi-Agent Usage (Proactive Splitting Principle)
+- **Default stance: when in doubt, split work to a sub-agent.**
+- Criteria for spawning sub-agents: modify 2 or more files OR explore 3 or more directories.
+- Direct handling scope: handle only **one file, one function change** yourself.
+- If the leader explicitly says "process in parallel with sub-agents," split subtasks as independently as possible and run them concurrently.
+- Number of sub-agents: spawn as many as there are subtasks, up to **4 maximum**.
+- Apply the same behavior rules to sub-agents as well (concise, scope discipline, no overreach).
+- Integrate sub-agent results and report them back to the leader in a single response.
+- If a sub-agent fails, retry only that subtask and keep the successful work.
 
-## 프로세스 보호
-- kill, pkill, killall 명령 사용 금지.
-- tmux kill-pane, tmux kill-window, tmux kill-session 사용 금지.
-- 다른 tmux pane이나 세션의 프로세스를 절대 종료하지 않는다.
-- 포트/파일 충돌 시 기존 프로세스를 죽이지 말고 보고한다.
+## Process Protection
+- Do not use kill, pkill, or killall commands.
+- Do not use tmux kill-pane, tmux kill-window, or tmux kill-session.
+- Never terminate processes in other tmux panes or sessions.
+- If a port/file conflict occurs, report it instead of killing the existing process.
 
-## 제약
-- 사용자의 원래 목표를 축소하거나 타협안을 제시하지 않는다.
-- "불가능하다"고 결론 내리기 전에 다른 접근법을 먼저 탐색한다.
+## Constraints
+- Do not reduce the user's original goal or propose compromises.
+- Before concluding "impossible," explore other approaches first.
 `;
 
-// goal이 있으면 baseInstructions에 목적 컨텍스트를 주입
+// If goal exists, inject goal context into baseInstructions
 function buildBaseInstructions(teamGoal) {
   if (!teamGoal) return BASE_INSTRUCTIONS_CORE;
   return `${BASE_INSTRUCTIONS_CORE}
-## 팀 목적 (Goal Context)
+## Team Goal (Goal Context)
 > ${teamGoal}
 
-- 모든 작업은 위 팀 목적에 기여해야 한다.
-- 작업의 "왜?"를 항상 의식하고, 목적에서 벗어나는 작업은 하지 않는다.
-- 판단이 불확실할 때 팀 목적을 기준으로 우선순위를 결정한다.
+- All work must contribute to the team goal above.
+- Always keep the "why?" of the task in mind, and do not do work that strays from the goal.
+- When judgment is uncertain, prioritize based on the team goal.
 `;
 }
 
@@ -74,19 +74,19 @@ let running = true;
 let shutdownRequested = false;
 let currentChild = null;
 let viewerProc = null;
-let viewerFifoPath = null;   // tmux FIFO 경로 (cleanup용)
-let viewerTmuxPaneId = null; // tmux pane ID (cleanup용)
+let viewerFifoPath = null;   // tmux FIFO path (for cleanup)
+let viewerTmuxPaneId = null; // tmux pane ID (for cleanup)
 let logStream = null;
 // Real session info from app-server (populated after thread/start)
 let sessionInfo = null;
 let currentPollMs = POLL_INTERVAL_MS;
-let leaderOutbox = null; // pollLoop에서 초기화
-let _borderAgentName = null; // border-status용 에이전트 이름 (main에서 설정)
-let nativeTuiPaneId = null;       // 네이티브 Codex TUI pane ID (cleanup용)
-let nativeTuiSessionName = null;  // 네이티브 TUI tmux 세션 이름 (cleanup용)
-let wsPort = null;                // WebSocket app-server 포트 (네이티브 TUI용)
-let ansiFallbackLogged = false;   // ANSI fallback 전환 로그 1회 제한
-let nativeTuiSpawning = false;    // TUI spawn 진행 중 플래그
+let leaderOutbox = null; // initialized in pollLoop
+let _borderAgentName = null; // agent name for border-status (set in main)
+let nativeTuiPaneId = null;       // native Codex TUI pane ID (for cleanup)
+let nativeTuiSessionName = null;  // native TUI tmux session name (for cleanup)
+let wsPort = null;                // WebSocket app-server port (for native TUI)
+let ansiFallbackLogged = false;   // limit ANSI fallback transition log to once
+let nativeTuiSpawning = false;    // flag indicating TUI spawn is in progress
 
 // ─── Inline mkdir-based Lock (proper-lockfile compatible) ───
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -146,7 +146,7 @@ function parseArgs(argv) {
   };
 }
 
-// ─── Goal Context (Paperclip-inspired "왜?" 추적) ───
+// ─── Goal Context (Paperclip-inspired "why?" tracking) ───
 function readTeamGoal(teamName) {
   try {
     const configPath = join(TEAMS_BASE, sanitize(teamName), "config.json");
@@ -224,7 +224,7 @@ function closeViewer() {
   viewerProc = null;
 }
 
-// ─── Pane Renderer: app-server notification → Codex exec 스타일 출력 ───
+// ─── Pane Renderer: app-server notifications → Codex exec-style output ───
 const ANSI = {
   reset: "\x1b[0m",
   bold: "\x1b[1m",
@@ -255,14 +255,14 @@ function truncateMiddle(str, maxLen) {
   return str.slice(0, half) + ellipsis + str.slice(str.length - half);
 }
 
-// 현재 렌더링 상태 (스트리밍 모드 추적)
+// Current render state (tracking streaming mode)
 const renderState = {
   mode: "idle", // "idle" | "agent" | "exec" | "file" | "reasoning"
   lastItemId: null,
   lastTokenTotal: 0,
-  lastCmd: null, // 현재 실행 중인 명령어 정보
-  headerPrinted: false, // 세션 헤더 출력 여부
-  // exec outputDelta를 스트리밍한 아이템 추적 (완료 시 aggregatedOutput 중복 방지)
+  lastCmd: null, // info about the currently running command
+  headerPrinted: false, // whether the session header was printed
+  // track items whose exec outputDelta was streamed (avoid duplicating aggregatedOutput on completion)
   execStreamedItems: new Set(),
   // ── Compact mode state ──
   compactMode: process.env.CODEX_BRIDGE_VERBOSE !== "1",
@@ -274,7 +274,7 @@ const renderState = {
   turnStartedAt: 0,            // timestamp for elapsed time display
 };
 
-// 핵심 이벤트를 로그 + ANSI pane 양쪽에 출력
+// Output key events to both the log and ANSI pane
 function logAndRender(tag, msg) {
   log(tag, msg);
   renderWrite(`${ANSI.yellow}[${tag}]${ANSI.reset} ${msg}\n`);
@@ -299,7 +299,7 @@ function endStreamMode() {
   }
 }
 
-// Codex exec 스타일: "label\ncontent" 형식의 섹션 헤더
+// Codex exec style: section header in "label\ncontent" format
 function renderLabel(label, color = ANSI.cyan) {
   renderWrite(`${ANSI.bold}${color}${label}${ANSI.reset}\n`);
 }
@@ -389,7 +389,7 @@ function renderNotificationANSI(method, params) {
   const compact = renderState.compactMode;
 
   switch (method) {
-    // ── 턴 시작 ──
+    // ── Turn started ──
     case "turn/started": {
       endStreamMode();
       if (compact) {
@@ -405,7 +405,7 @@ function renderNotificationANSI(method, params) {
       break;
     }
 
-    // ── 턴 완료 ──
+    // ── Turn completed ──
     case "turn/completed": {
       endStreamMode();
       const turn = params.turn || {};
@@ -438,7 +438,7 @@ function renderNotificationANSI(method, params) {
       break;
     }
 
-    // ── 에이전트 메시지 스트리밍 ──
+    // ── Agent message streaming ──
     case "item/agentMessage/delta": {
       if (compact) {
         renderState.suppressedLines++;
@@ -456,7 +456,7 @@ function renderNotificationANSI(method, params) {
       break;
     }
 
-    // ── 명령 실행 출력 (스트리밍) ──
+    // ── Command execution output (streaming) ──
     case "item/commandExecution/outputDelta": {
       if (compact) {
         if (params.itemId) renderState.execStreamedItems.add(params.itemId);
@@ -476,7 +476,7 @@ function renderNotificationANSI(method, params) {
       break;
     }
 
-    // ── 파일 변경 출력 ──
+    // ── File change output ──
     case "item/fileChange/outputDelta": {
       if (compact) {
         renderState.suppressedLines++;
@@ -492,7 +492,7 @@ function renderNotificationANSI(method, params) {
       break;
     }
 
-    // ── 추론 요약 스트리밍 ──
+    // ── Reasoning summary streaming ──
     case "item/reasoning/summaryTextDelta": {
       if (compact) {
         renderState.suppressedLines++;
@@ -509,7 +509,7 @@ function renderNotificationANSI(method, params) {
       break;
     }
 
-    // ── 아이템 시작 ──
+    // ── Item started ──
     case "item/started": {
       const item = params.item;
       if (!item) break;
@@ -526,7 +526,7 @@ function renderNotificationANSI(method, params) {
           renderState.currentPhase = "exec";
           renderCompactView();
         } else {
-          // exec 시작 헤더를 즉시 출력 (스트리밍 중 명령 식별)
+          // print the exec start header immediately (identify command during streaming)
           const cmdW = getPaneWidth() - 16;
           renderLabel("[RUN] exec", ANSI.yellow);
           renderWrite(`${ANSI.dim}\u25b6 ${truncateMiddle(item.command || "", cmdW)} in ${truncateMiddle(item.cwd || "", 30)}${ANSI.reset}\n`);
@@ -561,7 +561,7 @@ function renderNotificationANSI(method, params) {
       break;
     }
 
-    // ── 아이템 완료 ──
+    // ── Item completed ──
     case "item/completed": {
       const item = params.item;
       if (!item) break;
@@ -591,7 +591,7 @@ function renderNotificationANSI(method, params) {
             renderCompactView();
           }
         } else {
-          // Codex exec 스타일: "exec\ncommand in dir succeeded/failed in Xms:\noutput"
+          // Codex exec style: "exec\ncommand in dir succeeded/failed in Xms:\noutput"
           const dur = item.durationMs != null ? `${item.durationMs}ms` : "";
           const succeeded = item.exitCode === 0;
           const statusWord = succeeded
@@ -599,7 +599,7 @@ function renderNotificationANSI(method, params) {
             : `${ANSI.red}failed (exit=${item.exitCode})${ANSI.reset}`;
           renderLabel(succeeded ? "[OK] exec" : "[ERR] exec", succeeded ? ANSI.green : ANSI.red);
           { const _cw = getPaneWidth() - 30; renderWrite(`${ANSI.dim}${truncateMiddle(item.command || "", _cw)} in ${truncateMiddle(item.cwd || "", 30)}${ANSI.reset} ${statusWord} ${ANSI.dim}in ${dur}${ANSI.reset}:\n`); }
-          // 이미 스트리밍된 출력은 재출력하지 않음 (중복 방지)
+          // do not reprint output already streamed (avoid duplication)
           if (item.aggregatedOutput && !alreadyStreamed) {
             renderWrite(`${item.aggregatedOutput}${item.aggregatedOutput.endsWith("\n") ? "" : "\n"}`);
           }
@@ -643,7 +643,7 @@ function renderNotificationANSI(method, params) {
       break;
     }
 
-    // ── 계획 업데이트 ──
+    // ── Plan update ──
     case "turn/plan/updated": {
       endStreamMode();
       if (compact) {
@@ -676,7 +676,7 @@ function renderNotificationANSI(method, params) {
       break;
     }
 
-    // ── Diff 업데이트 ──
+    // ── Diff update ──
     case "turn/diff/updated": {
       endStreamMode();
       if (compact) {
@@ -715,7 +715,7 @@ function renderNotificationANSI(method, params) {
       break;
     }
 
-    // ── 토큰 사용량 ──
+    // ── Token usage ──
     case "thread/tokenUsage/updated": {
       const usage = params.tokenUsage;
       if (!usage) break;
@@ -724,7 +724,7 @@ function renderNotificationANSI(method, params) {
       break;
     }
 
-    // ── 에러 (always show in full) ──
+    // ── Error (always show in full) ──
     case "error": {
       endStreamMode();
       const err = params.error;
@@ -769,7 +769,7 @@ function normalizeSandboxPolicy(sandbox) {
 }
 
 function renderNotification(method, params) {
-  // 네이티브 TUI 모드: resume으로 같은 thread를 공유하므로 bridge 렌더링 불필요
+  // Native TUI mode: no bridge rendering needed because resume shares the same thread
   if (nativeTuiPaneId) return;
 
   if (viewerProc && viewerProc.stdin && !viewerProc.stdin.destroyed) {
@@ -827,7 +827,7 @@ function findTuiBin() {
 }
 
 function spawnTuiViewer(agentName) {
-  // Real Codex TUI binary (--pipe-fd support) — 존재할 때만
+  // Real Codex TUI binary (--pipe-fd support) — only if present
   let tuiBin = findTuiBin();
   if (tuiBin && existsSync(tuiBin)) {
     const realVersion = getCodexVersion();
@@ -848,11 +848,11 @@ function spawnTuiViewer(agentName) {
   return null;
 }
 
-// ─── tmux pane 기반 TUI 뷰어 ───
+// ─── TUI viewer based on a tmux pane ───
 function spawnTuiTmuxPane(agentName) {
   const fifoPath = `/tmp/codex-tui-${process.pid}.fifo`;
 
-  // FIFO 생성
+  // Create FIFO
   try { unlinkSync(fifoPath); } catch {}
   const mkResult = spawnSync("mkfifo", [fifoPath], { timeout: 3000 });
   if (mkResult.status !== 0) {
@@ -860,7 +860,7 @@ function spawnTuiTmuxPane(agentName) {
     return null;
   }
 
-  // tmux pane에서 Ink 뷰어 실행
+  // Run Ink viewer in a tmux pane
   const baseDir = import.meta.dirname || new URL(".", import.meta.url).pathname;
   const viewerPath = join(baseDir, "codex-ink-viewer.mjs");
   if (!existsSync(viewerPath)) {
@@ -872,7 +872,7 @@ function spawnTuiTmuxPane(agentName) {
   const cmd = `exec node ${JSON.stringify(viewerPath)} --name ${JSON.stringify(agentName)} --fifo ${JSON.stringify(fifoPath)}`;
   const splitResult = spawnSync("tmux", [
     "split-window", "-h", "-l", "45%",
-    "-P", "-F", "#{pane_id}",  // pane ID 출력
+    "-P", "-F", "#{pane_id}",  // print pane ID
     cmd,
   ], { encoding: "utf8", timeout: 5000 });
 
@@ -885,22 +885,22 @@ function spawnTuiTmuxPane(agentName) {
   const paneId = (splitResult.stdout || "").trim();
   log("TUI", `tmux pane created: ${paneId}`);
 
-  // #3 근본 수정: break-pane 제거 — bridge와 viewer를 같은 윈도우에 유지
-  // 이유: break-pane하면 viewer가 죽을 때 윈도우 pane이 0개 → tmux 윈도우 자동 삭제
-  //       → bridge는 숨은 백그라운드 윈도우에서 돌지만 사용자에겐 "꺼짐"으로 보임
-  // viewer pane에 포커스만 이동, bridge pane은 같은 윈도우에 split으로 유지
+  // #3 root fix: remove break-pane — keep bridge and viewer in the same window
+  // Reason: if break-pane is used and the viewer dies, the window ends up with 0 panes → tmux auto-deletes the window
+  //       → bridge keeps running in a hidden background window, but appears "closed" to the user
+  // Move focus only to the viewer pane; keep the bridge pane split in the same window
   try {
     spawnSync("tmux", ["select-pane", "-t", paneId], { stdio: "ignore", timeout: 2000 });
   } catch {}
-  // 리더(team-lead) pane으로 포커스 복원
+  // Restore focus to the leader (team-lead) pane
   try {
     spawnSync("tmux", ["select-pane", "-l"], { stdio: "ignore", timeout: 2000 });
   } catch {}
 
-  // FIFO를 O_RDWR로 열기 (blocking 방지 Unix 트릭)
+  // Open FIFO with O_RDWR (Unix trick to prevent blocking)
   let fd;
   try {
-    fd = openSync(fifoPath, "r+"); // O_RDWR → reader 없어도 block 안 됨
+    fd = openSync(fifoPath, "r+"); // O_RDWR → does not block even without a reader
   } catch (err) {
     log("TUI", `FIFO open failed: ${err.message}`);
     try { spawnSync("tmux", ["kill-pane", "-t", paneId], { stdio: "ignore" }); } catch {}
@@ -914,7 +914,7 @@ function spawnTuiTmuxPane(agentName) {
     viewerProc = null;
   });
 
-  // viewerProc 호환 객체 (renderNotification이 viewerProc.stdin 사용)
+  // viewerProc-compatible object (renderNotification uses viewerProc.stdin)
   viewerFifoPath = fifoPath;
   viewerTmuxPaneId = paneId;
 
@@ -926,7 +926,7 @@ function spawnTuiTmuxPane(agentName) {
   };
 }
 
-// ─── 네이티브 Codex TUI (app-server WebSocket 경유) ───
+// ─── Native Codex TUI (via app-server WebSocket) ───
 
 function findCodexAlphaBin() {
   // 1. CODEX_ALPHA_BIN env
@@ -969,7 +969,7 @@ function findCodexAlphaBin() {
     }
   }
   log("TUI-DETECT", "codex-alpha/codex-next not found on PATH");
-  // 4. 기본 codex가 0.117+이면 그대로 사용
+  // 4. If default codex is 0.117+, use it as-is
   const ver = getCodexVersion();
   log("TUI-DETECT", `checking codex native TUI support (version=${ver || "unknown"})`);
   if (ver) {
@@ -1036,7 +1036,7 @@ function getRandomPort() {
   });
 }
 
-let nativeTuiChild = null; // 네이티브 TUI child process
+let nativeTuiChild = null; // native TUI child process
 
 function attachNativeTuiChildHandlers(child, onAbnormalExit = null) {
   let recoveryTriggered = false;
@@ -1124,8 +1124,8 @@ async function spawnNativeTuiInPlace(agentName, port, threadId, sessionFilePath 
     }
   }
 
-  // TUI를 bridge와 같은 pane에서 실행 (stdio: "inherit" → 터미널 공유)
-  // bridge는 뒤에서 IPC만 처리, TUI가 화면을 차지
+  // Run TUI in the same pane as bridge (stdio: "inherit" → shared terminal)
+  // bridge only handles IPC in the background while TUI takes over the screen
   const args = threadId
     ? ["resume", threadId, "--remote", `ws://127.0.0.1:${port}`, "--enable", "tui_app_server"]
     : ["--remote", `ws://127.0.0.1:${port}`, "--enable", "tui_app_server"];
@@ -1136,7 +1136,7 @@ async function spawnNativeTuiInPlace(agentName, port, threadId, sessionFilePath 
     log("NATIVE-TUI", `spawning in-place (attempt ${attempt}/${maxRetries + 1}): ${codexBin} ${args.join(" ")}`);
 
     const child = spawn(codexBin, args, {
-      stdio: ["inherit", "inherit", "pipe"],  // stderr만 캡처
+      stdio: ["inherit", "inherit", "pipe"],  // capture stderr only
       cwd: process.cwd(),
       env: { ...process.env },
     });
@@ -1146,13 +1146,13 @@ async function spawnNativeTuiInPlace(agentName, port, threadId, sessionFilePath 
     });
 
     nativeTuiChild = child;
-    nativeTuiPaneId = "in-place"; // pane 분리 없음 표시
+    nativeTuiPaneId = "in-place"; // indicates no pane split
 
-    // pane 제목을 에이전트 이름으로 설정
+    // Set pane title to the agent name
     if (process.env.TMUX) {
       try {
         spawnSync("tmux", ["select-pane", "-T", `${agentName} [codex-tui]`], { stdio: "ignore", timeout: 2000 });
-        // 포커스를 오케로 복원
+        // Restore focus to the previous pane
         spawnSync("tmux", ["select-pane", "-l"], { stdio: "ignore", timeout: 2000 });
       } catch {}
     }
@@ -1198,7 +1198,7 @@ function attachViewerHandlers(proc) {
     log("TUI", `viewer exited (code=${code})`);
     viewerProc = null;
   });
-  // EPIPE 방지: viewer가 먼저 죽으면 stdin.write()에서 에러 이벤트 발생
+  // Prevent EPIPE: if the viewer dies first, stdin.write() emits an error event
   if (proc.stdin) {
     proc.stdin.on("error", (err) => {
       log("TUI", `viewer stdin error: ${err.code || err.message}`);
@@ -1236,7 +1236,7 @@ async function readInbox(inboxPath) {
   }
 }
 
-// ─── Claim + MarkAsRead 통합: 1회 lock/parse/write ───
+// ─── Claim + MarkAsRead combined: one lock/parse/write cycle ───
 async function claimUnreadMessages(inboxPath) {
   return withLock(inboxPath, async () => {
     const messages = await readInbox(inboxPath);
@@ -1274,9 +1274,9 @@ async function writeToInbox(inboxPath, message) {
 }
 
 // ─── Leader Outbox (CAS + micro-batching + in-memory spool) ───
-// 1) CAS+temp rename: lock 보유 시간 최소화
-// 2) micro-batching: 50ms debounce로 여러 메시지를 1회 write
-// 3) in-memory spool: 워커별 큐 → flush 시에만 leader inbox에 쓰기
+// 1) CAS+temp rename: minimize lock hold time
+// 2) micro-batching: one write for multiple messages with 50ms debounce
+// 3) in-memory spool: per-worker queue → write to leader inbox only on flush
 class LeaderOutbox {
   constructor(leaderInboxPath) {
     this.path = leaderInboxPath;
@@ -1331,7 +1331,7 @@ class LeaderOutbox {
       throw e;
     }
 
-    // CAS 실패: 다른 워커가 변경 → fallback (전통적 lock+rewrite)
+    // CAS failed: another worker changed it → fallback (traditional lock+rewrite)
     if (!ok) {
       try { unlinkSync(tmp); } catch {}
       log("CAS-RETRY", `mtime changed, fallback to full lock`);
@@ -1342,7 +1342,7 @@ class LeaderOutbox {
       });
     }
 
-    // 로깅은 sendToLeader/sendIdleNotification에서 이미 수행
+    // Logging is already handled in sendToLeader/sendIdleNotification
   }
 
   destroy() {
@@ -1399,7 +1399,7 @@ function makeShutdownApproved(agentName, requestId) {
   };
 }
 
-// ─── tmux pane title 상태 업데이트 ───
+// ─── Update tmux pane title status ───
 function updatePaneTitle(agentName, status) {
   if (!process.env.TMUX) return;
   try {
@@ -1407,7 +1407,7 @@ function updatePaneTitle(agentName, status) {
   } catch {}
 }
 
-// ─── tmux border-status 설정 (pane 상단에 타이틀 표시) ───
+// ─── Configure tmux border-status (show title at the top of pane) ───
 function setupPaneBorderStatus(paneId) {
   if (!paneId && !process.env.TMUX) return;
   try {
@@ -1417,7 +1417,7 @@ function setupPaneBorderStatus(paneId) {
   } catch {}
 }
 
-// ─── tmux border-status 헤더 업데이트 (throttled) ───
+// ─── Update tmux border-status header (throttled) ───
 let _lastBorderUpdateAt = 0;
 const BORDER_UPDATE_THROTTLE_MS = 500;
 
@@ -1476,7 +1476,7 @@ let lastIdleSentAt = 0;
 const IDLE_COOLDOWN_MS = 30000;
 
 async function sendIdleNotification(config, opts = {}) {
-  // 상태 변경(완료/에러)은 항상 전송, 순수 idle 반복은 쿨다운
+  // Always send state changes (completed/error); pure idle repeats use cooldown
   const isStateChange = opts.completedStatus || opts.idleReason === "error";
   if (!isStateChange) {
     const now = Date.now();
@@ -1507,7 +1507,7 @@ async function sendIdleNotification(config, opts = {}) {
 
 async function handleShutdown(config, request) {
   log("SHUTDOWN", `reason: ${request.reason || "none"}`);
-  shuttingDown = true; // #2 수정: 시그널 핸들러 재진입 방지
+  shuttingDown = true; // #2 fix: prevent signal handler re-entry
   const response = makeShutdownApproved(config.agentName, request.requestId);
   const leaderInbox = getLeaderInboxPath(config.teamName);
   const msg = makeMessage(
@@ -1525,15 +1525,15 @@ async function handleShutdown(config, request) {
   running = false;
   closeViewer();
 
-  // 네이티브 팀 프로토콜: config.json에서 자신을 제거 (process_shutdown_approved 역할)
+  // Native team protocol: remove self from config.json (process_shutdown_approved role)
   await removeSelfFromConfig(config).catch((err) => {
     log("CLEANUP-ERR", `Failed to remove self from config: ${err.message}`);
   });
 
-  // killMyPane은 main() 최종 단계에서 호출 (session.close 이후)
+  // killMyPane is called in the final step of main() (after session.close)
 }
 
-// ─── Self-Cleanup: config.json에서 자신을 제거 ───
+// ─── Self-Cleanup: remove self from config.json ───
 async function removeSelfFromConfig(config) {
   const configPath = join(TEAMS_BASE, sanitize(config.teamName), "config.json");
   if (!existsSync(configPath)) return;
@@ -1554,13 +1554,13 @@ async function removeSelfFromConfig(config) {
 function killMyPane() {
   if (process.env.TMUX_PANE) {
     try {
-      // spawnSync: 모든 정리 완료 후 마지막에 호출되므로 동기 실행 안전
+      // spawnSync: safe to run synchronously because this is the last call after all cleanup completes
       spawnSync("tmux", ["kill-pane", "-t", process.env.TMUX_PANE], { stdio: "ignore", timeout: 2000 });
     } catch { /* best effort */ }
   }
 }
 
-// ─── Task Auto-Complete: 자기 이름으로 할당된 in_progress 태스크를 completed로 ───
+// ─── Task Auto-Complete: mark in_progress tasks assigned to this agent as completed ───
 import { readdirSync } from "node:fs";
 
 async function markMyTasksCompleted(config) {
@@ -1591,7 +1591,7 @@ async function markMyTasksCompleted(config) {
 }
 
 // ─── Codex App Server Session ───
-// GPT 5.4 high 고정 — xhigh 사용 금지
+// GPT 5.4 high fixed — do not use xhigh
 const codexEffort = "high";
 
 function truncateOutput(output) {
@@ -1602,7 +1602,7 @@ function truncateOutput(output) {
   return output;
 }
 
-// ─── 2단계 저장: 전체 결과 → 파일, 미리보기 → inbox ───
+// ─── Two-stage storage: full result → file, preview → inbox ───
 function getResultsDir(teamName) {
   return join(TEAMS_BASE, sanitize(teamName), "results");
 }
@@ -1619,10 +1619,10 @@ async function saveResultFile(config, output) {
 
 function makePreview(output, filePath) {
   if (output.length <= PREVIEW_CHARS) {
-    return output; // 짧으면 그대로
+    return output; // if short, return as-is
   }
   const preview = output.slice(0, PREVIEW_CHARS).trimEnd();
-  return `${preview}\n\n... [전체 결과(${output.length}자): ${filePath}]`;
+  return `${preview}\n\n... [Full output (${output.length} chars): ${filePath}]`;
 }
 
 function formatRpcError(error) {
@@ -1640,7 +1640,7 @@ class AppServerSession {
     this.teamGoal = opts.teamGoal || null;
     this.useWebSocket = opts.useWebSocket || false;
     this.wsPort = opts.wsPort || null;
-    this.ws = null;       // WebSocket 연결 (ws 모드)
+    this.ws = null;       // WebSocket connection (ws mode)
     this.child = null;
     this.threadId = null;
     this.sessionFilePath = null;
@@ -1653,7 +1653,7 @@ class AppServerSession {
     this.startPromise = null;
     this.wsRestartPromise = null;
     this.closed = false;
-    // lifecycle 콜백
+    // lifecycle callbacks
     this.onStatus = opts.onStatus || null;
     this.onError = opts.onError || null;
   }
@@ -1692,7 +1692,7 @@ class AppServerSession {
     child.stderr.setEncoding("utf8");
 
     if (this.useWebSocket && this.wsPort) {
-      // WebSocket 모드: stderr에서 "listening on" 대기 → ws 연결
+      // WebSocket mode: wait for "listening on" on stderr → connect ws
       child.stderr.on("data", (chunk) => {
         const text = String(chunk).trim();
         if (text) log("APP-SERVER", text);
@@ -1700,7 +1700,7 @@ class AppServerSession {
       child.on("close", (code, signal) => this.handleClose(child, code, signal));
       child.on("error", (err) => this.handleFatal(err, child));
 
-      // readyz 대기 후 WebSocket 연결
+      // connect WebSocket after readyz
       const wsUrl = `ws://127.0.0.1:${this.wsPort}`;
       log("WS", `waiting for app-server on ${wsUrl}...`);
       await this.waitForReady(this.wsPort);
@@ -1785,7 +1785,7 @@ class AppServerSession {
       });
       log("WS", "connected to app-server");
     } else {
-      // stdio 모드 (기존)
+      // stdio mode (existing)
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", (chunk) => this.handleStdout(chunk));
       child.stderr.on("data", (chunk) => {
@@ -1809,7 +1809,7 @@ class AppServerSession {
         approvalPolicy: "never",
         sandbox: "danger-full-access",
         cwd: this.cwd,
-        // model은 Codex 자체 설정 사용 (Claude 모델명 전달 방지)
+        // use Codex's own model setting (prevent passing a Claude model name)
         baseInstructions: buildBaseInstructions(this.teamGoal),
       };
 
@@ -2125,7 +2125,7 @@ class AppServerSession {
           this.sendResponse(msg.id, { decision: "approved" });
           return;
         default:
-          // full-auto 모드: 미지 승인 요청도 기본 accept (새 Codex 버전 호환)
+          // full-auto mode: default-accept unknown approval requests too (compatible with new Codex versions)
           log("APPROVAL", `auto-accepting unknown server request: ${msg.method}`);
           this.sendResponse(msg.id, { decision: "accept" });
       }
@@ -2137,7 +2137,7 @@ class AppServerSession {
   handleNotification(method, params) {
     if (!params) return;
 
-    // ★ Pane 렌더러: 모든 notification을 ANSI 시각 피드백으로 출력
+    // ★ Pane renderer: print all notifications as ANSI visual feedback
     renderNotification(method, params);
 
     if (method === "turn/started") {
@@ -2242,7 +2242,7 @@ class AppServerSession {
       throw new Error("app-server thread is not initialized");
     }
 
-    // 활성 turn이 있으면 steer로 이어 붙인다.
+    // If there is an active turn, append via steer.
     if (this.currentTurn) {
       const activeTurnId = this.activeTurnId || this.currentTurn.turnId;
       if (!activeTurnId) {
@@ -2251,7 +2251,7 @@ class AppServerSession {
       await this.sendRequest("turn/steer", {
         threadId: this.threadId,
         expectedTurnId: activeTurnId,
-        input: [{ type: "text", text: `[STEER — 리더로부터 실시간 메시지]\n${prompt}` }],
+        input: [{ type: "text", text: `[STEER — Real-time message from leader]\n${prompt}` }],
       });
       return;
     }
@@ -2323,16 +2323,16 @@ class AppServerSession {
   }
 }
 
-// ─── Main Poll Loop (Phase 2: 양방향 — 턴 실행 중에도 inbox 폴링) ───
+// ─── Main Poll Loop (Phase 2: bidirectional — poll inbox even during turn execution) ───
 async function pollLoop(config) {
   const myInbox = getInboxPath(config.agentName, config.teamName);
   await ensureInbox(myInbox);
   currentPollMs = POLL_INTERVAL_MS;
 
-  // ─── Leader Outbox 초기화 ───
+  // ─── Initialize Leader Outbox ───
   leaderOutbox = new LeaderOutbox(getLeaderInboxPath(config.teamName));
 
-  // lifecycle 상태 이벤트: 리더에게 중간 진행 보고
+  // lifecycle status events: report intermediate progress to the leader
   let lastStatusSentAt = 0;
   const STATUS_COOLDOWN_MS = 3000;
   function emitStatus(status) {
@@ -2341,14 +2341,14 @@ async function pollLoop(config) {
     lastStatusSentAt = now;
     sendToLeader(config, `[STATUS] ${status}`, status).catch(() => {});
     updateBorderStatus(config.agentName);
-    // 네이티브 TUI 모드: bridge pane 1줄에 상태 표시
+    // Native TUI mode: show status on a single line in the bridge pane
     if (nativeTuiPaneId) {
       const label = `\x1b[1;36m ${config.agentName} \x1b[0m \x1b[33m${status}\x1b[0m`;
       process.stderr.write(`\r\x1b[2K${label}`);
     }
   }
 
-  // Goal Context: 팀 config.json에서 목적(description) 읽기
+  // Goal Context: read purpose (description) from team config.json
   const teamGoal = readTeamGoal(sanitize(config.teamName));
   if (teamGoal) {
     log("GOAL", `team goal: ${teamGoal.slice(0, 100)}`);
@@ -2395,7 +2395,7 @@ async function pollLoop(config) {
     wsPort: wsPort,
     onStatus: (status) => {
       emitStatus(status);
-      // 네이티브 TUI: session ready 시점에 tmux pane 스폰 (threadId로 resume)
+      // Native TUI: spawn tmux pane when session is ready (resume by threadId)
       if (config._useNativeTui && status === "session ready" && !nativeTuiPaneId && wsPort) {
         void spawnNativeTuiForSession();
       }
@@ -2408,14 +2408,14 @@ async function pollLoop(config) {
 
   log("POLL", `inbox: ${myInbox}`);
 
-  // ─── fs.watch 기반 inbox 감시 (polling fallback 겸용) ───
+  // ─── Inbox watch based on fs.watch (also used as polling fallback) ───
   const inboxDir = join(myInbox, "..");
   const inboxBasename = basename(myInbox);
   let watchResolve = null;
   let fsWatcher = null;
   try {
     fsWatcher = fsWatch(inboxDir, { persistent: false }, (eventType, filename) => {
-      // 내 inbox 파일 변경에만 반응 (thundering herd 방지)
+      // React only to changes in my inbox file (prevent thundering herd)
       if (filename && filename !== inboxBasename) return;
       if (watchResolve) {
         const r = watchResolve;
@@ -2443,9 +2443,9 @@ async function pollLoop(config) {
     });
   }
 
-  // 활성 턴의 완료를 추적하는 promise (null = 유휴 상태)
+  // promise tracking completion of the active turn (null = idle)
   let activeTurnPromise = null;
-  // steer 직렬화 체인 + 실패 시 보관 큐
+  // steer serialization chain + queue to hold failures
   let steerChain = Promise.resolve();
   let pendingSteerQueue = [];
   const MAX_PENDING_STEERS = 32;
@@ -2458,13 +2458,13 @@ async function pollLoop(config) {
     pendingSteerQueue.push(text);
   }
 
-  // 메시지 중복 처리 방지 (content hash + 시간 기반)
+  // prevent duplicate message handling (content hash + time based)
   const DEDUP_MAX = 100;
-  const DEDUP_TTL_MS = 60_000; // 60초 후 만료
+  const DEDUP_TTL_MS = 60_000; // expires after 60 seconds
   const recentMessageHashes = new Map(); // hash → timestamp
   const recentMessageOrder = []; // { hash, ts } FIFO
   function makeMessageHash(msg) {
-    // from + text 앞부분으로 경량 해시 생성
+    // generate lightweight hash from from + start of text
     const key = `${msg.from}|${msg.text.slice(0, 512)}`;
     let h = 0;
     for (let i = 0; i < key.length; i++) {
@@ -2474,7 +2474,7 @@ async function pollLoop(config) {
   }
   function isDuplicateMessage(msg) {
     const now = Date.now();
-    // 만료된 항목 정리
+    // clean up expired entries
     while (recentMessageOrder.length > 0 && (now - recentMessageOrder[0].ts > DEDUP_TTL_MS || recentMessageOrder.length > DEDUP_MAX)) {
       const old = recentMessageOrder.shift();
       recentMessageHashes.delete(old.hash);
@@ -2486,7 +2486,7 @@ async function pollLoop(config) {
     return false;
   }
 
-  // 턴 완료 핸들러: 결과를 리더에게 전송
+  // turn completion handler: send result to the leader
   async function handleTurnResult(result) {
     activeTurnPromise = null;
     steerChain = Promise.resolve();
@@ -2508,13 +2508,13 @@ async function pollLoop(config) {
     updatePaneTitle(config.agentName, result.success ? "done" : "error");
     updateBorderStatus(config.agentName);
 
-    // 결과 summary에 첫 줄 키워드 포함 (구분 용이)
+    // include first-line keyword in result summary (easy to distinguish)
     const summaryHint = result.output
       ? result.output.split("\n").find((l) => l.trim())?.slice(0, 60) || ""
       : "";
 
     if (result.success) {
-      // 2단계 저장: 전체 → 파일, 미리보기 → inbox
+      // two-stage storage: full result → file, preview → inbox
       const filePath = await saveResultFile(config, result.output).catch((e) => {
         logAndRenderError("SAVE-ERR", `result file save failed: ${e.message}`);
         return null;
@@ -2523,10 +2523,10 @@ async function pollLoop(config) {
         ? makePreview(result.output, filePath)
         : result.output;
       const summary = summaryHint ? `Done: ${summaryHint}` : "Codex task completed";
-      // await로 결과 전송 완료 후 idle 전송 (순서 보장)
+      // send idle after result delivery completes with await (preserve order)
       await sendToLeaderWithRetry(config, msg, summary);
       if (shutdownRequested) return;
-      // 태스크 완료를 먼저 마킹한 후 idle 전송 (순서 보장으로 재스케줄링 방지)
+      // mark tasks completed before sending idle (preserve order to prevent rescheduling)
       const taskResult = await markMyTasksCompleted(config);
       if (shutdownRequested) return;
       if (taskResult.success) {
@@ -2547,7 +2547,7 @@ async function pollLoop(config) {
         ? makePreview(fullErr, filePath)
         : fullErr;
       const summary = summaryHint ? `Failed: ${summaryHint}` : "Codex task failed";
-      // await로 결과 전송 완료 후 idle 전송 (순서 보장)
+      // send idle after result delivery completes with await (preserve order)
       await sendToLeaderWithRetry(config, errMsg, summary);
       if (shutdownRequested) return;
       sendIdleNotification(config, {
@@ -2608,7 +2608,7 @@ async function pollLoop(config) {
 
           const protocol = tryParseProtocol(msg.text);
 
-          // shutdown_request 처리: 즉시 플래그 설정 후 활성 턴 완료 대기
+          // handle shutdown_request: set flag immediately, then wait for active turn to finish
           if (protocol?.type === "shutdown_request") {
             running = false;
             shutdownRequested = true;
@@ -2621,7 +2621,7 @@ async function pollLoop(config) {
               ]).catch(() => "error");
               if (race === "timeout") {
                 log("SHUTDOWN", "timeout — interrupting active turn");
-                // #4 수정: interrupt도 5초 제한 (기존 RPC 30초 대기 방지)
+                // #4 fix: limit interrupt to 5 seconds too (prevent waiting for old 30s RPC timeout)
                 await Promise.race([
                   session.interruptActiveTurn(),
                   sleep(5000),
@@ -2633,7 +2633,7 @@ async function pollLoop(config) {
             return;
           }
 
-          // 프로토콜 메시지 스킵
+          // skip protocol messages
           if (protocol?.type === "permission_request") {
             log("SKIP", "permission_request (Codex uses own sandbox)");
             continue;
@@ -2647,7 +2647,7 @@ async function pollLoop(config) {
             continue;
           }
 
-          // 메시지 중복 처리 방지 (동일 메시지 재전송 감지)
+          // prevent duplicate message handling (detect resend of same message)
           if (isDuplicateMessage(msg)) {
             log("DEDUP", `skipping duplicate message from=${msg.from}, len=${msg.text.length}`);
             continue;
@@ -2655,12 +2655,12 @@ async function pollLoop(config) {
 
           const taskText = msg.text;
 
-          // ★ Phase 2 핵심: 활성 턴이 있으면 steer, 없으면 새 턴
+          // ★ Core of Phase 2: if an active turn exists, steer; otherwise start a new turn
           if (activeTurnPromise) {
             if (session.currentTurn) {
-              // 양방향: 실행 중인 Codex에 실시간 메시지 주입
+              // bidirectional: inject real-time messages into running Codex
               log("STEER", `injecting mid-turn message, len=${taskText.length}`);
-              // steer는 직렬화: 이전 steer 완료 후 다음 steer 전송
+              // serialize steer: send next steer only after previous steer finishes
               steerChain = steerChain.then(async () => {
                 if (!session.currentTurn) {
                   enqueuePendingSteer(taskText);
@@ -2671,7 +2671,7 @@ async function pollLoop(config) {
                   await session.runTurn(taskText);
                 } catch (steerErr) {
                   logAndRenderError("STEER-ERR", steerErr.message);
-                  // steer 실패 시 pendingSteerQueue에 보관 → 다음 턴에서 처리
+                  // if steer fails, store in pendingSteerQueue → handle on next turn
                   enqueuePendingSteer(taskText);
                   logAndRender("STEER-QUEUED", `queued for next turn (${pendingSteerQueue.length} pending)`);
                 }
@@ -2681,10 +2681,10 @@ async function pollLoop(config) {
               enqueuePendingSteer(taskText);
             }
           } else {
-            // 유휴 상태: 새 턴 시작 (비동기 — 블로킹하지 않음!)
-            // pendingSteerQueue에 실패한 steer가 있으면 본문에 포함
+            // idle state: start a new turn (async — do not block!)
+            // if pendingSteerQueue has failed steers, include them in the body
             let fullPrompt = taskText;
-            // Goal Context: 첫 턴에 팀 목적을 프롬프트에 포함
+            // Goal Context: include team goal in the first-turn prompt
             if (teamGoal && !session.threadId) {
               fullPrompt = `[GOAL] ${teamGoal}\n\n${fullPrompt}`;
             }
@@ -2694,7 +2694,7 @@ async function pollLoop(config) {
               fullPrompt = [fullPrompt, ...queued].join("\n\n---\n\n");
             }
             log("TASK", `from=${msg.from}, len=${fullPrompt.length}`);
-            // 리더에게 작업 수락 ack 전송 (비동기, 블로킹 안 함)
+            // send task acceptance ack to the leader (async, non-blocking)
             const coldStart = !session.threadId;
             const ackMsg = coldStart
               ? `[STATUS] task accepted, starting codex app-server...`
@@ -2714,10 +2714,10 @@ async function pollLoop(config) {
 
       if (running) {
         if (fsWatcher) {
-          // fs.watch: 이벤트 대기 + fallback timeout
+          // fs.watch: wait for event + fallback timeout
           await waitForInboxChange(sawMessages ? POLL_ACTIVE_MS : POLL_FALLBACK_MS);
         } else {
-          // fallback: adaptive polling (기존 동작)
+          // fallback: adaptive polling (existing behavior)
           if (!sawMessages) {
             currentPollMs = Math.min(currentPollMs * 2, POLL_IDLE_MS);
           }
@@ -2726,18 +2726,18 @@ async function pollLoop(config) {
       }
     }
   } finally {
-    // fs.watch 정리
+    // clean up fs.watch
     if (fsWatcher) {
       try { fsWatcher.close(); } catch {}
       fsWatcher = null;
     }
-    // outbox flush + 정리
+    // flush + cleanup outbox
     if (leaderOutbox) {
       await leaderOutbox.flush().catch(() => {});
       leaderOutbox.destroy();
       leaderOutbox = null;
     }
-    // 활성 턴이 있으면 완료를 잠시 기다려본다
+    // if there is an active turn, wait briefly for completion
     if (activeTurnPromise) {
       await Promise.race([activeTurnPromise, sleep(2000)]).catch(() => {});
     }
@@ -2752,7 +2752,7 @@ function setupSignalHandlers(config) {
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
     process.on(sig, async () => {
       if (shuttingDown) {
-        // #2 수정: 이미 종료 중이면 즉시 강제 종료
+        // #2 fix: if already shutting down, force exit immediately
         log("SIGNAL", `${sig} received during shutdown — force exit`);
         closeViewer();
         closeLogFile();
@@ -2763,7 +2763,7 @@ function setupSignalHandlers(config) {
       shuttingDown = true;
       log("SIGNAL", sig);
       running = false;
-      // #2 수정: 5초 내 종료 못 하면 강제 종료
+      // #2 fix: if unable to exit within 5 seconds, force exit
       const forceTimer = setTimeout(() => {
         log("SIGNAL", "force exit after 5s timeout");
         closeViewer();
@@ -2783,7 +2783,7 @@ function setupSignalHandlers(config) {
       } catch {
         // best effort
       }
-      // 시그널 종료 시에도 config.json에서 자신 제거
+      // remove self from config.json even on signal shutdown
       await removeSelfFromConfig(config).catch(() => {});
       closeViewer();
       closeLogFile();
@@ -2794,27 +2794,27 @@ function setupSignalHandlers(config) {
 }
 
 // ─── Claude Passthrough ───
-// 에이전트 이름이 "claude-"로 시작하면 원래 Claude Code 바이너리로 패스스루
+// If the agent name starts with "claude-", pass through to the original Claude Code binary
 function passthroughToClaude() {
   const claudeBin = process.env.CLAUDE_BIN
     || spawnSync("which", ["claude"], { encoding: "utf8", timeout: 3000 }).stdout?.trim()
     || join(homedir(), ".local", "bin", "claude");
   const originalArgs = process.argv.slice(2);
 
-  // bridge 전용 플래그 필터링 (Claude CLI에 전달하면 안 되는 것들)
-  // 주의: --agent-name, --team-name, --agent-id, --parent-session-id, --agent-type은
-  // Claude Code 팀 시스템이 사용하므로 필터링하면 안 됨
+  // Filter bridge-only flags (things that must not be passed to Claude CLI)
+  // Note: --agent-name, --team-name, --agent-id, --parent-session-id, and --agent-type
+  // are used by the Claude Code team system, so they must not be filtered out
   const BRIDGE_ONLY_FLAGS = new Set([
     "--agent-color"
   ]);
   const filteredArgs = [];
   for (let i = 0; i < originalArgs.length; i++) {
     if (BRIDGE_ONLY_FLAGS.has(originalArgs[i])) {
-      i++; // 값도 스킵
+      i++; // skip value too
       continue;
     }
     if (originalArgs[i] === "--effort") {
-      i++; // 기존 --effort 값 스킵 (아래에서 재추가)
+      i++; // skip existing --effort value (re-added below)
       continue;
     }
     filteredArgs.push(originalArgs[i]);
@@ -2822,18 +2822,18 @@ function passthroughToClaude() {
 
   log("PASSTHROUGH", `Forwarding to Claude Code: ${claudeBin}`);
 
-  // 스폰 후 리더 pane으로 포커스 자동 복원
+  // Automatically restore focus to the leader pane after spawn
   try {
     spawn("tmux", ["select-pane", "-l"], { stdio: "ignore", detached: true }).unref();
-  } catch { /* tmux 없는 환경에서는 무시 */ }
+  } catch { /* ignore when tmux is unavailable */ }
 
   const child = spawn(claudeBin, [...filteredArgs, "--effort", "high"], {
     stdio: "inherit",
     cwd: process.cwd(),
     env: {
       ...process.env,
-      CLAUDE_CODE_TEAMMATE_COMMAND: "",  // bridge 재귀 방지
-      CLAUDE_CODE_SKIP_TRUST: "1",       // trust 대화상자 건너뛰기
+      CLAUDE_CODE_TEAMMATE_COMMAND: "",  // prevent bridge recursion
+      CLAUDE_CODE_SKIP_TRUST: "1",       // skip trust dialog
     },
   });
 
@@ -2873,10 +2873,10 @@ async function main() {
     process.exit(1);
   }
 
-  // ANSI/TUI 탐지 로그도 파일에 남기도록 최대한 초기에 초기화
+  // Initialize as early as possible so ANSI/TUI detection logs are also written to file
   initLogFile(config.agentName);
 
-  // 라우팅: codex-* → 항상 Codex, claude-* → Claude, 그 외 → 모델명으로 판단
+  // Routing: codex-* → always Codex, claude-* → Claude, otherwise decide by model name
   if (!config.agentName.startsWith("codex-")) {
     const modelLower = typeof config.model === "string" ? config.model.toLowerCase() : "";
     const isClaudeModel = /claude|sonnet|opus|haiku/i.test(modelLower);
@@ -2889,20 +2889,20 @@ async function main() {
   log("INFO", `cwd=${process.cwd()}`);
   log("INFO", `pid=${process.pid}`);
 
-  // tmux pane title 설정 (워커명 표시)
+  // Set tmux pane title (show worker name)
   if (process.env.TMUX) {
     try {
       spawnSync("tmux", ["select-pane", "-T", `${config.agentName} [idle]`], { stdio: "ignore", timeout: 2000 });
     } catch {}
-    setupPaneBorderStatus(); // pane 상단 border에 타이틀 표시
+    setupPaneBorderStatus(); // show title in the top pane border
   }
   _borderAgentName = config.agentName;
 
-  // ─── 네이티브 Codex TUI 자동 감지 ───
-  // 1. CODEX_BRIDGE_NATIVE_TUI=1 → 강제 활성화
-  // 2. codex 0.117+ → 자동 활성화
-  // 3. codex-alpha 바이너리 존재 → 자동 활성화
-  // 4. CODEX_BRIDGE_NATIVE_TUI=0 → 강제 비활성화
+  // ─── Native Codex TUI auto-detection ───
+  // 1. CODEX_BRIDGE_NATIVE_TUI=1 → force enable
+  // 2. codex 0.117+ → auto-enable
+  // 3. codex-alpha binary exists → auto-enable
+  // 4. CODEX_BRIDGE_NATIVE_TUI=0 → force disable
   let nativeTuiBin = findCodexAlphaBin();
   const codexVersion = getCodexVersion();
   const codexSupportsNativeTui = !!(codexVersion && (() => {
@@ -2920,13 +2920,13 @@ async function main() {
   if (useNativeTui) {
     wsPort = await getRandomPort();
     log("NATIVE-TUI", `WebSocket mode enabled, port=${wsPort}, bin=${nativeTuiBin}`);
-    // 네이티브 TUI pane은 app-server ready 후 스폰 (pollLoop 진입 전)
+    // Native TUI pane is spawned after app-server ready (before entering pollLoop)
     config._useNativeTui = true;
-    nativeTuiSpawning = true;   // session ready 전 notification에서도 ANSI fallback 억제
+    nativeTuiSpawning = true;   // suppress ANSI fallback even for notifications before session ready
   }
 
-  // TUI 뷰어: 기본 비활성 (ANSI fallback)
-  // CODEX_BRIDGE_TUI=1로 Ink 뷰어, CODEX_BRIDGE_NATIVE_TUI=1로 네이티브 TUI
+  // TUI viewer: disabled by default (ANSI fallback)
+  // CODEX_BRIDGE_TUI=1 for Ink viewer, CODEX_BRIDGE_NATIVE_TUI=1 for native TUI
   if (!useNativeTui && process.env.CODEX_BRIDGE_TUI === "1") {
     if (process.env.TMUX) {
       viewerProc = spawnTuiTmuxPane(config.agentName);
@@ -2937,7 +2937,7 @@ async function main() {
       viewerProc = spawnTuiViewer(config.agentName);
     }
   } else if (!useNativeTui) {
-    // ANSI fallback (기본값) — bridge pane에서 직접 렌더링
+    // ANSI fallback (default) — render directly in bridge pane
     log("TUI", "using ANSI fallback (default)");
     if (process.env.TMUX) {
       try {
@@ -2953,7 +2953,7 @@ async function main() {
   closeNativeTuiPane();
   closeViewer();
   closeLogFile();
-  // 리더가 shutdown_approved를 읽을 시간 확보 후 pane 종료
+  // close the pane after giving the leader time to read shutdown_approved
   await sleep(2000);
   killMyPane();
   process.exit(0);
