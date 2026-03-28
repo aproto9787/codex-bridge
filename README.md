@@ -122,6 +122,69 @@ codex-bridge.mjs (single file, ~2750 lines)
 
 The bridge uses mostly Node.js built-ins for core functionality — `ink` and `react` for the optional TUI viewer, and `ws` (via transitive dependency) for WebSocket mode.
 
+## Usage Examples
+
+### Basic: Codex-only team
+
+Spawn a team where all workers run through Codex CLI:
+
+```
+Leader (Claude Code)
+├── codex-analyst   → researches codebase
+├── codex-impl      → writes the code
+└── codex-test      → runs and writes tests
+```
+
+In Claude Code, the leader orchestrates via TeamCreate:
+
+> "codex-analyst: explore the auth module and summarize how sessions are managed"
+> → codex-impl picks up the findings and implements the fix
+> → codex-test validates the result
+
+### Mixed team: Codex workers + Claude reviewers
+
+Use Codex for heavy lifting, Claude for judgment calls:
+
+```
+Leader (Claude Code)
+├── codex-analyst    → codebase exploration (Codex)
+├── codex-impl       → implementation (Codex)
+├── claude-reviewer  → code review & design judgment (Claude)
+└── claude-architect → architectural decisions (Claude)
+```
+
+Routing is automatic — just name your agents with the right prefix:
+- `codex-*` → routed to Codex CLI
+- `claude-*` → routed to Claude Code passthrough
+
+### Common worker roles
+
+| Agent name | Role | Backend |
+|---|---|---|
+| `codex-analyst` | Codebase exploration, research | Codex |
+| `codex-impl` | Feature implementation, bug fixes | Codex |
+| `codex-test` | Test writing, test execution | Codex |
+| `codex-reviewer` | Pattern checks, lint-level review | Codex |
+| `claude-reviewer` | Design judgment, complex review | Claude |
+| `claude-architect` | High-level decisions, tradeoffs | Claude |
+| `claude-frontend` | UI/UX implementation | Claude |
+
+### Full workflow example
+
+```bash
+# 1. Set up the bridge
+export CLAUDE_CODE_TEAMMATE_COMMAND="/path/to/codex-bridge/run-bridge.sh"
+
+# 2. Start Claude Code
+claude
+
+# 3. In Claude Code — the leader spawns a mixed team and delegates:
+#    codex-analyst explores the repo
+#    codex-impl writes the feature
+#    claude-reviewer reviews the result
+#    All coordination happens through ~/.claude/teams/ IPC
+```
+
 ## How team communication works
 
 1. **Leader** writes a task to the worker's inbox (`~/.claude/teams/<team>/inboxes/<worker>.json`)
