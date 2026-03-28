@@ -149,7 +149,7 @@ function parseArgs(argv) {
 // ─── Goal Context (Paperclip-inspired "왜?" 추적) ───
 function readTeamGoal(teamName) {
   try {
-    const configPath = join(TEAMS_BASE, teamName, "config.json");
+    const configPath = join(TEAMS_BASE, sanitize(teamName), "config.json");
     if (!existsSync(configPath)) return null;
     const raw = JSON.parse(readFileSync(configPath, "utf-8"));
     return raw.description || null;
@@ -188,7 +188,8 @@ function log(tag, msg) {
 }
 
 function initLogFile(agentName) {
-  const logPath = `/tmp/codex-bridge-${agentName}.log`;
+  const safeAgentName = String(agentName).replace(/[^a-zA-Z0-9_\-@.]/g, "_");
+  const logPath = `/tmp/codex-bridge-${safeAgentName}.log`;
   logStream = createWriteStream(logPath, { flags: "a" });
   log("LOG", `redirected to ${logPath}`);
 }
