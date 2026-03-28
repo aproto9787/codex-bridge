@@ -1,10 +1,35 @@
-# codex-bridge
+<div align="center">
 
-A bridge that integrates **OpenAI Codex CLI** as a native teammate within [Claude Code](https://docs.anthropic.com/en/docs/claude-code)'s team system — enabling **cross-model multi-agent collaboration** from a single orchestrator.
+# Codex Bridge
 
-## Screenshot
+**Cross-model multi-agent collaboration from a single orchestrator.**
+
+Integrate OpenAI Codex CLI as a native teammate within [Claude Code](https://docs.anthropic.com/en/docs/claude-code)'s team system.
+
+![version](https://img.shields.io/badge/version-0.1.0-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
+![platform](https://img.shields.io/badge/platform-linux-lightgrey)
+![node](https://img.shields.io/badge/node-%E2%89%A5%2018-brightgreen)
+
+</div>
+
+---
 
 ![codex-bridge](codex-bridge.png)
+
+## Table of Contents
+
+- [What it does](#what-it-does)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Setup](#setup)
+- [Usage](#usage)
+- [Routing Rules](#routing-rules)
+- [Environment Variables](#environment-variables)
+- [Architecture](#architecture)
+- [Usage Examples](#usage-examples)
+- [How Team Communication Works](#how-team-communication-works)
+- [License](#license)
 
 ## What it does
 
@@ -21,7 +46,7 @@ Claude Code's `TeamCreate` system can spawn multiple AI agents that collaborate 
 └───────────┴───────────┴─────────────────┘
 ```
 
-### Key features
+### Key Features
 
 - **Dual routing** — Agent name prefix determines the backend: `codex-*` → Codex App Server, `claude-*` → Claude Code passthrough, otherwise routes by model name
 - **File-based IPC** — Uses `~/.claude/teams/` inbox/outbox JSON files with `fs.watch` + polling for reliable cross-process communication
@@ -41,10 +66,12 @@ Claude Code's `TeamCreate` system can spawn multiple AI agents that collaborate 
 
 ## Requirements
 
-- **Node.js** ≥ 18
-- **Claude Code** CLI installed and configured
-- **OpenAI Codex CLI** (`codex`) in PATH (for Codex workers)
-- **tmux** (optional, for TUI viewer panes)
+| Dependency | Version | Required |
+|---|---|---|
+| **Node.js** | >= 18 | Yes |
+| **Claude Code** CLI | latest | Yes |
+| **OpenAI Codex CLI** (`codex`) | latest | Yes (for Codex workers) |
+| **tmux** | any | Optional (for TUI viewer panes) |
 
 ## Installation
 
@@ -83,7 +110,7 @@ claude
 # TeamCreate with agent names like "claude-reviewer" → Claude
 ```
 
-### Routing rules
+## Routing Rules
 
 | Agent name pattern | Backend | Notes |
 |---|---|---|
@@ -97,7 +124,7 @@ claude
 node codex-bridge.mjs --agent-name codex-worker --team-name my-team
 ```
 
-## Environment variables
+## Environment Variables
 
 | Variable | Description | Default |
 |---|---|---|
@@ -125,50 +152,6 @@ codex-bridge.mjs (single file, ~2750 lines)
 ```
 
 The bridge uses mostly Node.js built-ins for core functionality — `ink` and `react` for the optional TUI viewer, and `ws` (via transitive dependency) for WebSocket mode.
-
-## Configuration
-
-### Recommended CLAUDE.md setup
-
-Add the following to your `CLAUDE.md` to get the most out of codex-bridge:
-
-````markdown
-## Team Worker Naming
-
-When using TeamCreate with codex-bridge:
-
-- `codex-*` workers → routed to OpenAI Codex CLI
-- `claude-*` workers → routed to Claude Code
-
-### Worker role conventions
-| Name | Role |
-|---|---|
-| `codex-analyst` | Codebase exploration, research |
-| `codex-impl` | Implementation, bug fixes |
-| `codex-test` | Test writing, test execution |
-| `claude-reviewer` | Design judgment, complex review |
-| `claude-architect` | High-level decisions |
-````
-
-### Skill example
-
-You can define a custom skill to standardize your team setup.
-Create `.claude/skills/codex-team.md`:
-
-````markdown
-Spawn a mixed codex/claude team for the current task.
-
-1. TeamCreate with description of the goal
-2. Spawn workers:
-   - codex-analyst: explore and research
-   - codex-impl: implement
-   - claude-reviewer: review the result
-3. Assign tasks and wait for completion
-4. Run user-advocate verification
-5. TeamDelete
-````
-
-Then invoke with `/codex-team` in Claude Code.
 
 ## Usage Examples
 
@@ -233,7 +216,7 @@ claude
 #    All coordination happens through ~/.claude/teams/ IPC
 ```
 
-## How team communication works
+## How Team Communication Works
 
 1. **Leader** writes a task to the worker's inbox (`~/.claude/teams/<team>/inboxes/<worker>.json`)
 2. **Bridge** detects the file change via `fs.watch` (with polling fallback), ignores duplicate deliveries, and sends an immediate task-accepted ACK back to the leader
@@ -246,6 +229,4 @@ claude
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
-
-Copyright (c) 2025-2026 [aproto9787](https://github.com/aproto9787)
+[MIT License](LICENSE) — Copyright (c) 2025-2026 [aproto9787](https://github.com/aproto9787)
