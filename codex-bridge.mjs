@@ -8,6 +8,7 @@ import { join, basename } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { createServer } from "node:net";
+import { fileURLToPath } from "node:url";
 
 // ─── Constants ───
 const POLL_INTERVAL_MS = 500;
@@ -21,6 +22,8 @@ const PREVIEW_CHARS = 500; // inbox preview character count
 const TEAMS_BASE = join(homedir(), ".claude", "teams");
 const TASKS_BASE = join(homedir(), ".claude", "tasks");
 const LEADER_NAME = "team-lead";
+const MODULE_DIR = import.meta.dirname || fileURLToPath(new URL(".", import.meta.url));
+const TEAMAGENT_MD_PATH = join(MODULE_DIR, "teamagent.md");
 
 // ─── Team worker base instructions (injected via thread/start baseInstructions) ───
 const BASE_INSTRUCTIONS_CORE = `\
@@ -57,10 +60,42 @@ const BASE_INSTRUCTIONS_CORE = `\
 - Before concluding "impossible," explore other approaches first.
 `;
 
+const SEND_INSTRUCTIONS_FALLBACK = `\
+## SendMessage CLI
+- Use \`codex-bridge send <target> [--summary "text"] [--file path] "<message>"\` for teammate updates.
+- Targets: teammate name or \`*\` for broadcast.
+- Prefer short status updates. Use \`--summary\` for inbox previews.
+- Use \`--file\` for long text. The bridge stores the full text in \`results/\` and sends a preview to the inbox.
+- Default sender context is injected automatically via:
+  - \`CODEX_BRIDGE_AGENT_NAME\`
+  - \`CODEX_BRIDGE_TEAM_NAME\`
+  - \`CODEX_BRIDGE_AGENT_COLOR\`
+`;
+
+function loadTeamAgentInstructions() {
+  try {
+    return readFileSync(TEAMAGENT_MD_PATH, "utf8").trimEnd();
+  } catch (err) {
+    console.warn(`[codex-bridge] teamagent.md load failed (${TEAMAGENT_MD_PATH}): ${err.message}`);
+    return SEND_INSTRUCTIONS_FALLBACK;
+  }
+}
+
 // If goal exists, inject goal context into baseInstructions
-function buildBaseInstructions(teamGoal) {
-  if (!teamGoal) return BASE_INSTRUCTIONS_CORE;
-  return `${BASE_INSTRUCTIONS_CORE}
+function buildBaseInstructions({ teamGoal = null, teamName = null, agentName = null } = {}) {
+  const teammates = readTeamMemberNames(teamName, agentName);
+  const teammatesLine = teammates.length > 0
+    ? `- Available teammates: ${teammates.join(", ")}`
+    : "- Available teammates: none";
+  const teamAgentInstructions = loadTeamAgentInstructions();
+
+  let instructions = `${BASE_INSTRUCTIONS_CORE}
+${teamAgentInstructions}
+${teammatesLine}
+`;
+
+  if (!teamGoal) return instructions;
+  instructions += `
 ## Team Goal (Goal Context)
 > ${teamGoal}
 
@@ -68,6 +103,7 @@ function buildBaseInstructions(teamGoal) {
 - Always keep the "why?" of the task in mind, and do not do work that strays from the goal.
 - When judgment is uncertain, prioritize based on the team goal.
 `;
+  return instructions;
 }
 
 let running = true;
@@ -80,7 +116,7 @@ let logStream = null;
 // Real session info from app-server (populated after thread/start)
 let sessionInfo = null;
 let currentPollMs = POLL_INTERVAL_MS;
-let leaderOutbox = null; // initialized in pollLoop
+let messageRouter = null; // initialized in pollLoop
 let _borderAgentName = null; // agent name for border-status (set in main)
 let nativeTuiPaneId = null;       // native Codex TUI pane ID (for cleanup)
 let nativeTuiSessionName = null;  // native TUI tmux session name (for cleanup)
@@ -146,14 +182,86 @@ function parseArgs(argv) {
   };
 }
 
+function printSendUsage() {
+  console.error('Usage: codex-bridge send <target> [--summary "text"] [--file path] [--agent-name NAME] [--team-name TEAM] [--agent-color COLOR] "<message>"');
+}
+
+function parseSendCommandArgs(argv) {
+  const parsed = {
+    target: null,
+    message: null,
+    summary: null,
+    file: null,
+    agentName: process.env.CODEX_BRIDGE_AGENT_NAME || null,
+    teamName: process.env.CODEX_BRIDGE_TEAM_NAME || null,
+    agentColor: process.env.CODEX_BRIDGE_AGENT_COLOR || "cyan",
+  };
+  const positional = [];
+
+  for (let i = 3; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--summary" || arg === "--file" || arg === "--agent-name" || arg === "--team-name" || arg === "--agent-color") {
+      if (i + 1 >= argv.length) {
+        throw new Error(`Missing value for ${arg}`);
+      }
+      const value = argv[++i];
+      if (arg === "--summary") parsed.summary = value;
+      else if (arg === "--file") parsed.file = value;
+      else if (arg === "--agent-name") parsed.agentName = value;
+      else if (arg === "--team-name") parsed.teamName = value;
+      else if (arg === "--agent-color") parsed.agentColor = value;
+      continue;
+    }
+    if (arg.startsWith("--")) {
+      throw new Error(`Unknown option: ${arg}`);
+    }
+    positional.push(arg);
+  }
+
+  if (positional.length < 2) {
+    throw new Error("send requires both <target> and <message>");
+  }
+  if (positional.length > 2) {
+    throw new Error("send accepts exactly one <target> and one <message>");
+  }
+
+  parsed.target = positional[0];
+  parsed.message = positional[1];
+
+  if (!parsed.agentName) throw new Error("Missing agent name (--agent-name or CODEX_BRIDGE_AGENT_NAME)");
+  if (!parsed.teamName) throw new Error("Missing team name (--team-name or CODEX_BRIDGE_TEAM_NAME)");
+  if (!parsed.target) throw new Error("Missing target");
+  if (typeof parsed.message === "undefined") throw new Error("Missing message");
+
+  return parsed;
+}
+
 // ─── Goal Context (Paperclip-inspired "why?" tracking) ───
-function readTeamGoal(teamName) {
+function getTeamConfigPath(teamName) {
+  return join(TEAMS_BASE, sanitize(teamName), "config.json");
+}
+
+function readTeamConfig(teamName) {
   try {
-    const configPath = join(TEAMS_BASE, sanitize(teamName), "config.json");
+    if (!teamName) return null;
+    const configPath = getTeamConfigPath(teamName);
     if (!existsSync(configPath)) return null;
-    const raw = JSON.parse(readFileSync(configPath, "utf-8"));
-    return raw.description || null;
+    return JSON.parse(readFileSync(configPath, "utf-8"));
   } catch { return null; }
+}
+
+function readTeamGoal(teamName) {
+  return readTeamConfig(teamName)?.description || null;
+}
+
+function readTeamMemberNames(teamName, selfName = null) {
+  const members = readTeamConfig(teamName)?.members || [];
+  return [...new Set(
+    members
+      .map((member) => member?.name)
+      .filter(Boolean)
+      .filter((name) => name !== selfName)
+  )];
 }
 
 // ─── Path Helpers ───
@@ -167,10 +275,6 @@ function getInboxDir(teamName) {
 
 function getInboxPath(agentName, teamName) {
   return join(getInboxDir(teamName), `${sanitize(agentName)}.json`);
-}
-
-function getLeaderInboxPath(teamName) {
-  return join(getInboxDir(teamName), `${sanitize(LEADER_NAME)}.json`);
 }
 
 // ─── Visual Feedback (tmux pane) ───
@@ -871,7 +975,7 @@ function spawnTuiTmuxPane(agentName) {
 
   const cmd = `exec node ${JSON.stringify(viewerPath)} --name ${JSON.stringify(agentName)} --fifo ${JSON.stringify(fifoPath)}`;
   const splitResult = spawnSync("tmux", [
-    "split-window", "-h", "-l", "45%",
+    "split-window", "-d", "-h", "-l", "45%",
     "-P", "-F", "#{pane_id}",  // print pane ID
     cmd,
   ], { encoding: "utf8", timeout: 5000 });
@@ -888,14 +992,6 @@ function spawnTuiTmuxPane(agentName) {
   // #3 root fix: remove break-pane — keep bridge and viewer in the same window
   // Reason: if break-pane is used and the viewer dies, the window ends up with 0 panes → tmux auto-deletes the window
   //       → bridge keeps running in a hidden background window, but appears "closed" to the user
-  // Move focus only to the viewer pane; keep the bridge pane split in the same window
-  try {
-    spawnSync("tmux", ["select-pane", "-t", paneId], { stdio: "ignore", timeout: 2000 });
-  } catch {}
-  // Restore focus to the leader (team-lead) pane
-  try {
-    spawnSync("tmux", ["select-pane", "-l"], { stdio: "ignore", timeout: 2000 });
-  } catch {}
 
   // Open FIFO with O_RDWR (Unix trick to prevent blocking)
   let fd;
@@ -1152,8 +1248,6 @@ async function spawnNativeTuiInPlace(agentName, port, threadId, sessionFilePath 
     if (process.env.TMUX) {
       try {
         spawnSync("tmux", ["select-pane", "-T", `${agentName} [codex-tui]`], { stdio: "ignore", timeout: 2000 });
-        // Restore focus to the previous pane
-        spawnSync("tmux", ["select-pane", "-l"], { stdio: "ignore", timeout: 2000 });
       } catch {}
     }
 
@@ -1273,57 +1367,74 @@ async function writeToInbox(inboxPath, message) {
   });
 }
 
-// ─── Leader Outbox (CAS + micro-batching + in-memory spool) ───
+// ─── Message Router (CAS + micro-batching + in-memory spool) ───
 // 1) CAS+temp rename: minimize lock hold time
 // 2) micro-batching: one write for multiple messages with 50ms debounce
-// 3) in-memory spool: per-worker queue → write to leader inbox only on flush
-class LeaderOutbox {
-  constructor(leaderInboxPath) {
-    this.path = leaderInboxPath;
-    this.queue = [];
-    this.timer = null;
-    this.chain = Promise.resolve();
+// 3) in-memory spool: per-target queue → write to inbox only on flush
+class MessageRouter {
+  constructor(teamName) {
+    this.teamName = teamName;
+    this.targets = new Map();
   }
 
-  enqueue(msg) {
-    this.queue.push(msg);
-    if (!this.timer) {
-      this.timer = setTimeout(() => {
-        this.timer = null;
-        this.chain = this.chain
-          .then(() => this._drain())
-          .catch((e) => log("OUTBOX-ERR", e.message));
+  getState(target) {
+    if (!this.targets.has(target)) {
+      this.targets.set(target, {
+        path: getInboxPath(target, this.teamName),
+        queue: [],
+        timer: null,
+        chain: Promise.resolve(),
+      });
+    }
+    return this.targets.get(target);
+  }
+
+  enqueue(target, msg) {
+    const state = this.getState(target);
+    state.queue.push(msg);
+    if (!state.timer) {
+      state.timer = setTimeout(() => {
+        state.timer = null;
+        state.chain = state.chain
+          .then(() => this._drain(target, state))
+          .catch((e) => log("ROUTER-ERR", `${target}: ${e.message}`));
       }, FLUSH_DEBOUNCE_MS);
     }
   }
 
-  flush() {
-    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
-    this.chain = this.chain
-      .then(() => this._drain())
-      .catch((e) => log("OUTBOX-ERR", e.message));
-    return this.chain;
+  flush(target) {
+    const state = this.targets.get(target);
+    if (!state) return Promise.resolve();
+    if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+    state.chain = state.chain
+      .then(() => this._drain(target, state))
+      .catch((e) => log("ROUTER-ERR", `${target}: ${e.message}`));
+    return state.chain;
   }
 
-  async _drain() {
-    if (this.queue.length === 0) return;
-    const batch = this.queue.splice(0);
-    await ensureInbox(this.path);
+  flushAll() {
+    return Promise.all([...this.targets.keys()].map((target) => this.flush(target)));
+  }
+
+  async _drain(target, state) {
+    if (state.queue.length === 0) return;
+    const batch = state.queue.splice(0);
+    await ensureInbox(state.path);
 
     // Phase 1: prepare outside lock (heavy I/O)
-    const pre = await fsStat(this.path).catch(() => null);
-    const existing = await readInbox(this.path);
+    const pre = await fsStat(state.path).catch(() => null);
+    const existing = await readInbox(state.path);
     existing.push(...batch);
-    const tmp = `${this.path}.tmp.${process.pid}`;
+    const tmp = `${state.path}.tmp.${process.pid}`;
     await writeFile(tmp, JSON.stringify(existing), "utf-8");
 
     // Phase 2: CAS verify + atomic rename inside lock (minimal hold)
     let ok = false;
     try {
-      ok = await withLock(this.path, async () => {
-        const post = await fsStat(this.path).catch(() => null);
+      ok = await withLock(state.path, async () => {
+        const post = await fsStat(state.path).catch(() => null);
         if (pre && post && pre.mtimeMs !== post.mtimeMs) return false;
-        await rename(tmp, this.path);
+        await rename(tmp, state.path);
         return true;
       });
     } catch (e) {
@@ -1331,23 +1442,39 @@ class LeaderOutbox {
       throw e;
     }
 
-    // CAS failed: another worker changed it → fallback (traditional lock+rewrite)
+    // CAS failed: another writer changed it → fallback (traditional lock+rewrite)
     if (!ok) {
       try { unlinkSync(tmp); } catch {}
-      log("CAS-RETRY", `mtime changed, fallback to full lock`);
-      await withLock(this.path, async () => {
-        const msgs = await readInbox(this.path);
+      log("CAS-RETRY", `${target}: mtime changed, fallback to full lock`);
+      await withLock(state.path, async () => {
+        const msgs = await readInbox(state.path);
         msgs.push(...batch);
-        await writeFile(this.path, JSON.stringify(msgs), "utf-8");
+        await writeFile(state.path, JSON.stringify(msgs), "utf-8");
       });
     }
 
-    // Logging is already handled in sendToLeader/sendIdleNotification
+    // Logging is already handled in higher-level send helpers
   }
 
   destroy() {
-    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    for (const state of this.targets.values()) {
+      if (state.timer) {
+        clearTimeout(state.timer);
+        state.timer = null;
+      }
+    }
+    this.targets.clear();
   }
+}
+
+function resolveSendTargets(target, teamName, agentName) {
+  if (target !== "*") return [target];
+
+  const members = readTeamMemberNames(teamName, agentName);
+  if (members.length === 0) {
+    throw new Error("Broadcast target '*' has no recipients");
+  }
+  return members;
 }
 
 // ─── Message Helpers ───
@@ -1445,30 +1572,64 @@ function updateBorderStatus(agentName, config) {
 }
 
 // ─── Leader Communication ───
+async function sendEnvelope(config, target, msg, opts = {}) {
+  if (messageRouter) {
+    messageRouter.enqueue(target, msg);
+    if (opts.flush) await messageRouter.flush(target);
+  } else {
+    await writeToInbox(getInboxPath(target, config.teamName), msg);
+  }
+}
+
 async function sendToLeader(config, text, summary) {
   const msg = makeMessage(config.agentName, text, config.agentColor, summary);
-  if (leaderOutbox) {
-    leaderOutbox.enqueue(msg);
-  } else {
-    const leaderInbox = getLeaderInboxPath(config.teamName);
-    await writeToInbox(leaderInbox, msg);
-  }
+  await sendEnvelope(config, LEADER_NAME, msg);
   log("SENT", summary || text.slice(0, 60));
 }
 
 async function sendToLeaderWithRetry(config, text, summary) {
   try {
     await sendToLeader(config, text, summary);
-    if (leaderOutbox) await leaderOutbox.flush();
+    if (messageRouter) await messageRouter.flush(LEADER_NAME);
   } catch (err1) {
     log("SEND-RETRY", `first attempt failed: ${err1.message}, retrying...`);
     try {
       await sleep(500);
       await sendToLeader(config, text, summary);
-      if (leaderOutbox) await leaderOutbox.flush();
+      if (messageRouter) await messageRouter.flush(LEADER_NAME);
     } catch (err2) {
       logAndRenderError("SEND-FAIL", `result delivery failed permanently: ${err2.message}`);
     }
+  }
+}
+
+async function handleSendCommand(argv) {
+  let parsed;
+  try {
+    parsed = parseSendCommandArgs(argv);
+  } catch (err) {
+    console.error(`[codex-bridge] ${err.message}`);
+    printSendUsage();
+    return 1;
+  }
+
+  try {
+    const config = {
+      agentName: parsed.agentName,
+      teamName: parsed.teamName,
+      agentColor: parsed.agentColor,
+    };
+    const targets = resolveSendTargets(parsed.target, config.teamName, config.agentName);
+    const text = await buildSendText(config, parsed.message, parsed.file);
+    const msg = makeMessage(config.agentName, text, config.agentColor, parsed.summary);
+
+    for (const target of targets) {
+      await writeToInbox(getInboxPath(target, config.teamName), { ...msg });
+    }
+    return 0;
+  } catch (err) {
+    console.error(`[codex-bridge] ${err.message}`);
+    return err?.message?.startsWith("Lock timeout:") ? 3 : 2;
   }
 }
 
@@ -1493,13 +1654,7 @@ async function sendIdleNotification(config, opts = {}) {
     config.agentColor,
     opts.summary || "Codex worker idle"
   );
-  if (leaderOutbox) {
-    leaderOutbox.enqueue(msg);
-    if (isStateChange) await leaderOutbox.flush();
-  } else {
-    const leaderInbox = getLeaderInboxPath(config.teamName);
-    await writeToInbox(leaderInbox, msg);
-  }
+  await sendEnvelope(config, LEADER_NAME, msg, { flush: isStateChange });
   log("IDLE", opts.summary || "waiting for next task");
   updatePaneTitle(config.agentName, "idle");
   updateBorderStatus(config.agentName);
@@ -1509,19 +1664,13 @@ async function handleShutdown(config, request) {
   log("SHUTDOWN", `reason: ${request.reason || "none"}`);
   shuttingDown = true; // #2 fix: prevent signal handler re-entry
   const response = makeShutdownApproved(config.agentName, request.requestId);
-  const leaderInbox = getLeaderInboxPath(config.teamName);
   const msg = makeMessage(
     config.agentName,
     JSON.stringify(response),
     config.agentColor,
     "Shutdown approved"
   );
-  if (leaderOutbox) {
-    leaderOutbox.enqueue(msg);
-    await leaderOutbox.flush();
-  } else {
-    await writeToInbox(leaderInbox, msg);
-  }
+  await sendEnvelope(config, LEADER_NAME, msg, { flush: true });
   running = false;
   closeViewer();
 
@@ -1625,6 +1774,17 @@ function makePreview(output, filePath) {
   return `${preview}\n\n... [Full output (${output.length} chars): ${filePath}]`;
 }
 
+async function buildSendText(config, message, filePath) {
+  if (!filePath) return message;
+
+  const fullText = await readFile(filePath, "utf-8");
+  const storedPath = await saveResultFile(config, fullText);
+  const preview = makePreview(fullText, storedPath);
+
+  if (!message) return preview;
+  return `${message}\n\n${preview}`;
+}
+
 function formatRpcError(error) {
   if (!error) return "unknown RPC error";
   if (typeof error === "string") return error;
@@ -1638,6 +1798,9 @@ class AppServerSession {
     this.cwd = opts.cwd;
     this.effort = opts.effort || "high";
     this.teamGoal = opts.teamGoal || null;
+    this.agentName = opts.agentName || null;
+    this.teamName = opts.teamName || null;
+    this.agentColor = opts.agentColor || null;
     this.useWebSocket = opts.useWebSocket || false;
     this.wsPort = opts.wsPort || null;
     this.ws = null;       // WebSocket connection (ws mode)
@@ -1680,10 +1843,14 @@ class AppServerSession {
     if (this.useWebSocket && this.wsPort) {
       args.push("--listen", `ws://127.0.0.1:${this.wsPort}`);
     }
+    const childEnv = { ...process.env };
+    if (this.agentName) childEnv.CODEX_BRIDGE_AGENT_NAME = this.agentName;
+    if (this.teamName) childEnv.CODEX_BRIDGE_TEAM_NAME = this.teamName;
+    if (this.agentColor) childEnv.CODEX_BRIDGE_AGENT_COLOR = this.agentColor;
     const child = spawn(codexBin, args, {
       stdio: this.useWebSocket ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
       cwd: this.cwd,
-      env: { ...process.env },
+      env: childEnv,
     });
 
     this.child = child;
@@ -1810,7 +1977,11 @@ class AppServerSession {
         sandbox: "danger-full-access",
         cwd: this.cwd,
         // use Codex's own model setting (prevent passing a Claude model name)
-        baseInstructions: buildBaseInstructions(this.teamGoal),
+        baseInstructions: buildBaseInstructions({
+          teamGoal: this.teamGoal,
+          teamName: this.teamName,
+          agentName: this.agentName,
+        }),
       };
 
       const started = await this.sendRequest("thread/start", threadStartParams);
@@ -2329,8 +2500,8 @@ async function pollLoop(config) {
   await ensureInbox(myInbox);
   currentPollMs = POLL_INTERVAL_MS;
 
-  // ─── Initialize Leader Outbox ───
-  leaderOutbox = new LeaderOutbox(getLeaderInboxPath(config.teamName));
+  // ─── Initialize Message Router ───
+  messageRouter = new MessageRouter(config.teamName);
 
   // lifecycle status events: report intermediate progress to the leader
   let lastStatusSentAt = 0;
@@ -2349,7 +2520,7 @@ async function pollLoop(config) {
   }
 
   // Goal Context: read purpose (description) from team config.json
-  const teamGoal = readTeamGoal(sanitize(config.teamName));
+  const teamGoal = readTeamGoal(config.teamName);
   if (teamGoal) {
     log("GOAL", `team goal: ${teamGoal.slice(0, 100)}`);
   }
@@ -2391,6 +2562,9 @@ async function pollLoop(config) {
     cwd: process.cwd(),
     effort: codexEffort,
     teamGoal,
+    agentName: config.agentName,
+    teamName: config.teamName,
+    agentColor: config.agentColor,
     useWebSocket: !!config._useNativeTui,
     wsPort: wsPort,
     onStatus: (status) => {
@@ -2732,10 +2906,10 @@ async function pollLoop(config) {
       fsWatcher = null;
     }
     // flush + cleanup outbox
-    if (leaderOutbox) {
-      await leaderOutbox.flush().catch(() => {});
-      leaderOutbox.destroy();
-      leaderOutbox = null;
+    if (messageRouter) {
+      await messageRouter.flushAll().catch(() => {});
+      messageRouter.destroy();
+      messageRouter = null;
     }
     // if there is an active turn, wait briefly for completion
     if (activeTurnPromise) {
@@ -2822,11 +2996,6 @@ function passthroughToClaude() {
 
   log("PASSTHROUGH", `Forwarding to Claude Code: ${claudeBin}`);
 
-  // Automatically restore focus to the leader pane after spawn
-  try {
-    spawn("tmux", ["select-pane", "-l"], { stdio: "ignore", detached: true }).unref();
-  } catch { /* ignore when tmux is unavailable */ }
-
   const child = spawn(claudeBin, [...filteredArgs, "--effort", "high"], {
     stdio: "inherit",
     cwd: process.cwd(),
@@ -2865,6 +3034,11 @@ function passthroughToClaude() {
 
 // ─── Entry Point ───
 async function main() {
+  if (process.argv[2] === "send") {
+    const exitCode = await handleSendCommand(process.argv);
+    process.exit(exitCode);
+  }
+
   const config = parseArgs(process.argv);
 
   if (!config.agentName || !config.teamName) {
@@ -2939,11 +3113,6 @@ async function main() {
   } else if (!useNativeTui) {
     // ANSI fallback (default) — render directly in bridge pane
     log("TUI", "using ANSI fallback (default)");
-    if (process.env.TMUX) {
-      try {
-        spawn("tmux", ["select-pane", "-l"], { stdio: "ignore", detached: true }).unref();
-      } catch {}
-    }
   }
 
   setupSignalHandlers(config);
