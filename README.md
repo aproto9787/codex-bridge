@@ -49,15 +49,19 @@ Claude Code's `TeamCreate` system can spawn multiple AI agents that collaborate 
 ### Key Features
 
 - **Dual routing** — Agent name prefix determines the backend: `codex-*` → Codex App Server, `claude-*` → Claude Code passthrough, otherwise routes by model name
+- **Multi-worker teams** — Supports multiple Codex workers per team, so one leader can coordinate `codex-*` teammates in parallel
 - **File-based IPC** — Uses `~/.claude/teams/` inbox/outbox JSON files with `fs.watch` + polling for reliable cross-process communication
-- **Leader outbox batching** — Micro-batches leader messages (50ms debounce) to reduce file I/O
+- **MessageRouter queues** — Replaces the old leader-only outbox batching with per-target queues plus 50ms micro-batching to reduce file I/O
 - **2-stage result storage** — Full output saved to `results/` directory; only a preview (500 chars) goes to the inbox, keeping context windows lean
 - **Atomic file locking** — `mkdir`-based locks with stale detection for safe concurrent reads/writes
 - **TUI viewer** — Optional tmux pane with real-time streaming (ANSI fallback by default), plus native Codex TUI when available
+- **tmux focus preservation** — Worker-side tmux panes are created detached, so spawning a worker keeps focus on the leader pane
 - **Native TUI recovery** — If the in-place native TUI exits unexpectedly, the bridge restarts either the app-server + TUI or just the TUI depending on WebSocket health
 - **WebSocket recovery** — Unexpected WebSocket shutdown triggers a one-shot app-server restart on a fresh port, escalates from `SIGTERM` to `SIGKILL` if needed, and forces `error`-without-`close` into a close path so recovery actually runs
 - **Live steering** — Injects new messages into active turns via `turn/steer` without restarting, with pending queue for failed steers
 - **Goal-aware base instructions** — Injects worker behavior rules plus the team `config.json` `description` into `thread/start` base instructions
+- **File-based worker prompts** — Loads worker-specific prompt text from `teamagent.md`, so prompt updates do not require code changes
+- **Worker env injection** — Automatically injects `CODEX_BRIDGE_AGENT_NAME`, `CODEX_BRIDGE_TEAM_NAME`, and `CODEX_BRIDGE_AGENT_COLOR` into Codex worker processes
 - **Message deduplication** — Filters duplicate inbox deliveries with lightweight hash + TTL tracking before they can start or steer duplicate work
 - **Status and idle protocol** — Sends immediate task-accepted ACKs, throttled `[STATUS]` progress messages, and structured `idle_notification` updates for available/completed/error states
 - **Task auto-completion** — Marks the worker's own `in_progress` task files as `completed` before advertising availability again
@@ -110,6 +114,8 @@ claude
 # TeamCreate with agent names like "claude-reviewer" → Claude
 ```
 
+You can add as many `codex-*` teammates as a team needs; each worker gets its own inbox, session, and prompt context.
+
 ## Routing Rules
 
 | Agent name pattern | Backend | Notes |
@@ -136,13 +142,22 @@ node codex-bridge.mjs --agent-name codex-worker --team-name my-team
 | `CODEX_ALPHA_BIN` | Path to `codex-alpha` binary | Auto-discover |
 | `CODEX_BRIDGE_VERBOSE` | Set to `1` for verbose logging | `0` |
 
+When the bridge launches a Codex worker, it also injects these worker-scoped variables automatically:
+
+| Variable | Description |
+|---|---|
+| `CODEX_BRIDGE_AGENT_NAME` | Current worker name |
+| `CODEX_BRIDGE_TEAM_NAME` | Current team name |
+| `CODEX_BRIDGE_AGENT_COLOR` | Current worker color for inbox/status messages |
+
 ## Architecture
 
 ```
 codex-bridge.mjs (single file, ~2750 lines)
 ├── CLI arg parser & routing logic
 ├── File-based IPC (inbox/outbox with fs.watch)
-├── Leader outbox batcher (micro-batch writes)
+├── MessageRouter (per-target queues + micro-batch writes)
+├── teamagent.md loader for worker prompt injection
 ├── Codex App Server session (stdio JSON-RPC; WebSocket when native TUI)
 ├── Claude Code passthrough (stdio forwarding)
 ├── ANSI renderer (compact/full modes)
@@ -188,6 +203,24 @@ Routing is automatic — just name your agents with the right prefix:
 - `codex-*` → routed to Codex CLI
 - `claude-*` → routed to Claude Code passthrough
 
+### SendMessage CLI from Codex workers
+
+Codex workers can send teammate updates with a Claude-style command:
+
+```bash
+codex-bridge send <target> "<message>"
+```
+
+Examples:
+
+```bash
+codex-bridge send team-lead "Task #1 complete. README updated."
+codex-bridge send codex-test "Please verify the README examples."
+codex-bridge send "*" "Shared note: use the new send command for worker updates."
+```
+
+`--summary` can override the inbox preview, and `--file` stores long text in `results/` and sends only a short preview through the inbox.
+
 ### Common worker roles
 
 | Agent name | Role | Backend |
@@ -220,9 +253,9 @@ claude
 
 1. **Leader** writes a task to the worker's inbox (`~/.claude/teams/<team>/inboxes/<worker>.json`)
 2. **Bridge** detects the file change via `fs.watch` (with polling fallback), ignores duplicate deliveries, and sends an immediate task-accepted ACK back to the leader
-3. **Bridge** starts or reuses a Codex App Server session, injecting worker rules and the team goal (`config.json` `description`) into `thread/start`
+3. **Bridge** starts or reuses a Codex App Server session, loading worker rules from `teamagent.md`, injecting the team goal (`config.json` `description`) into `thread/start`, and exporting worker context via `CODEX_BRIDGE_AGENT_NAME`, `CODEX_BRIDGE_TEAM_NAME`, and `CODEX_BRIDGE_AGENT_COLOR`
 4. **Codex** processes the task, streaming events back through the bridge over stdio or WebSocket
-5. **Bridge** emits `[STATUS]` progress updates while the task is running and can steer additional messages into the active turn
+5. **Bridge** emits `[STATUS]` progress updates while the task is running, can steer additional messages into the active turn, and uses `MessageRouter` to queue outbound messages per target
 6. **Bridge** collects the full response, saves it to `results/`, and writes only a preview to the leader's inbox
 7. **Bridge** auto-completes the worker's task file when possible, then sends a structured `idle_notification` describing whether it is available, completed, or failed
 8. **Leader** reads the result and continues orchestration
