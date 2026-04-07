@@ -23,6 +23,7 @@ Integrate OpenAI Codex CLI as a native teammate within [Claude Code](https://doc
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Setup](#setup)
+- [Configuration](#configuration)
 - [Usage](#usage)
 - [Routing Rules](#routing-rules)
 - [Environment Variables](#environment-variables)
@@ -101,6 +102,22 @@ export CLAUDE_CODE_TEAMMATE_COMMAND="$(pwd)/run-bridge.sh"
 
 `run-bridge.sh` is a tiny wrapper that resolves the repository directory and executes `node codex-bridge.mjs "$@"`, which is convenient for shell profiles and direct debugging.
 
+## Configuration
+
+### Worker behavior rules (`teamagent.md`)
+
+`teamagent.md` in this repository is injected as base instructions into every Codex worker at session start. It defines the sub-agent prohibition, the full `codex-bridge send` CLI reference, and task reporting conventions.
+
+Edit it directly to customize worker behavior — no code changes required.
+
+### CLAUDE.md integration
+
+Add codex-bridge worker routing rules to your `~/.claude/CLAUDE.md` so Claude Code knows how to name and orchestrate workers. A ready-to-use template is in [`examples/CLAUDE.md`](examples/CLAUDE.md).
+
+### `/team` skill
+
+A Claude Code skill that guides the leader on team composition, worker templates, and the codex-bridge workflow. Install to `~/.claude/skills/team/SKILL.md`. A minimal starting point is in [`examples/team-skill.md`](examples/team-skill.md).
+
 ## Usage
 
 Once configured, use Claude Code's team system as usual. The bridge automatically routes agents based on naming convention:
@@ -153,7 +170,7 @@ When the bridge launches a Codex worker, it also injects these worker-scoped var
 ## Architecture
 
 ```
-codex-bridge.mjs (single file, ~2750 lines)
+codex-bridge.mjs (single file, ~3140 lines)
 ├── CLI arg parser & routing logic
 ├── File-based IPC (inbox/outbox with fs.watch)
 ├── MessageRouter (per-target queues + micro-batch writes)
