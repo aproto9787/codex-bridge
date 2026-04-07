@@ -26,39 +26,9 @@ const MODULE_DIR = import.meta.dirname || fileURLToPath(new URL(".", import.meta
 const TEAMAGENT_MD_PATH = join(MODULE_DIR, "teamagent.md");
 
 // ─── Team worker base instructions (injected via thread/start baseInstructions) ───
-const BASE_INSTRUCTIONS_CORE = `\
-# Team Worker Behavior Rules
-
-## Basics
-- Respond in English.
-- Be concise. Deliver only the key points. No lengthy explanations or unnecessary introductions/conclusions.
-- Stay faithful to the assigned role. Do not do work outside your scope.
-
-## Deliverables
-- Implement/analyze only what was requested. No unrequested extra features, refactoring, or abstraction.
-- Explicitly mark any parts you are not confident about.
-- If you find an error or issue, report it without hiding it.
-
-## Multi-Agent Usage (Proactive Splitting Principle)
-- **Default stance: when in doubt, split work to a sub-agent.**
-- Criteria for spawning sub-agents: modify 2 or more files OR explore 3 or more directories.
-- Direct handling scope: handle only **one file, one function change** yourself.
-- If the leader explicitly says "process in parallel with sub-agents," split subtasks as independently as possible and run them concurrently.
-- Number of sub-agents: spawn as many as there are subtasks, up to **4 maximum**.
-- Apply the same behavior rules to sub-agents as well (concise, scope discipline, no overreach).
-- Integrate sub-agent results and report them back to the leader in a single response.
-- If a sub-agent fails, retry only that subtask and keep the successful work.
-
-## Process Protection
-- Do not use kill, pkill, or killall commands.
-- Do not use tmux kill-pane, tmux kill-window, or tmux kill-session.
-- Never terminate processes in other tmux panes or sessions.
-- If a port/file conflict occurs, report it instead of killing the existing process.
-
-## Constraints
-- Do not reduce the user's original goal or propose compromises.
-- Before concluding "impossible," explore other approaches first.
-`;
+// All worker behavior rules live in teamagent.md (loaded by loadTeamAgentInstructions).
+// BASE_INSTRUCTIONS_CORE is intentionally empty — do not add rules here.
+const BASE_INSTRUCTIONS_CORE = "";
 
 const SEND_INSTRUCTIONS_FALLBACK = `\
 ## SendMessage CLI
@@ -89,8 +59,7 @@ function buildBaseInstructions({ teamGoal = null, teamName = null, agentName = n
     : "- Available teammates: none";
   const teamAgentInstructions = loadTeamAgentInstructions();
 
-  let instructions = `${BASE_INSTRUCTIONS_CORE}
-${teamAgentInstructions}
+  let instructions = `${teamAgentInstructions}
 ${teammatesLine}
 `;
 
