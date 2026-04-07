@@ -11,19 +11,10 @@
 - Explicitly mark anything you are not confident about.
 - If you find an error or issue, report it clearly.
 
-### Multi-Agent Usage
-- Default stance: when in doubt, split work to a sub-agent.
-- Spawn sub-agents when the task modifies 2 or more files, or explores 3 or more directories.
-- Handle directly only a narrow scope such as one file or one function change.
-- If the leader asks for parallel work, split subtasks as independently as possible and run them concurrently.
-- Use up to 4 sub-agents, matching the number of independent subtasks.
-- Integrate sub-agent results into one final report.
-- If one sub-agent fails, retry only that subtask.
-
-### Sub-Agent Rules
-- Keep each delegated task concrete and self-contained.
-- Assign clear ownership for files or responsibilities.
-- Tell sub-agents they are not alone in the codebase and must not revert others' changes.
+### Sub-Agent Usage
+- ⛔ **Do NOT use sub-agents.** Handle all work directly.
+- Sub-agents cannot use `codex-bridge send` and will break team communication.
+- If the task is too large, report to the leader and request additional workers instead.
 
 ### Process Protection
 - Do not use `kill`, `pkill`, or `killall`.
@@ -36,15 +27,59 @@
 - Do not propose compromises unless required.
 - Before concluding something is impossible, try other reasonable approaches first.
 
-## SendMessage CLI
-- Use `codex-bridge send <target> [--summary "text"] [--file path] "<message>"` for teammate updates.
-- Targets: teammate name or `*` for broadcast.
-- Prefer short status updates. Use `--summary` for inbox previews.
-- Use `--file` for long text. The bridge stores the full text in `results/` and sends a preview to the inbox.
-- Default sender context is injected automatically via:
-  - `CODEX_BRIDGE_AGENT_NAME`
-  - `CODEX_BRIDGE_TEAM_NAME`
-  - `CODEX_BRIDGE_AGENT_COLOR`
+## SendMessage CLI — Complete Reference
+
+**Binary**: `codex-bridge` — symlinked at `~/.local/bin/codex-bridge`
+- If `codex-bridge` is not found: use `node ~/.claude/codex-bridge/codex-bridge.mjs` as a drop-in replacement
+- ⛔ Do NOT explore bridge source files to figure out how to send messages
+
+### Syntax
+```
+codex-bridge send <target> [--summary "text"] [--file /path] "<message>"
+```
+
+### Targets
+| Target | Use when |
+|--------|----------|
+| `team-lead` | Reporting task results, asking questions, any leader communication |
+| `<worker-name>` | Direct message to a specific teammate (e.g. `codex-2`) |
+| `"*"` | Broadcast to the entire team |
+
+`team-lead` is always the leader's name — use it for all result reports.
+
+### Flags
+| Flag | Purpose |
+|------|---------|
+| `--summary "text"` | Short preview shown in leader's inbox — always include this |
+| `--file /path/to/file` | Attach a file for long output (bridge stores it and sends a preview) |
+
+`--agent-name`, `--team-name`, `--agent-color` are auto-injected from env — never specify them manually.
+
+### Examples
+
+**Report task completion (short):**
+```bash
+codex-bridge send team-lead --summary "auth module done" "Implemented JWT auth in src/auth.ts. All tests pass."
+```
+
+**Report long result via file:**
+```bash
+cat > /tmp/result.md << 'EOF'
+## Analysis Result
+... long content ...
+EOF
+codex-bridge send team-lead --summary "analysis complete" --file /tmp/result.md "Full result attached."
+```
+
+**Ask leader a question:**
+```bash
+codex-bridge send team-lead --summary "question" "Should I use approach A or B for the payment module?"
+```
+
+**Message another worker:**
+```bash
+codex-bridge send codex-2 --summary "dependency ready" "auth module is done, you can proceed with payment."
+```
 
 ## Team Worker Behavior
 

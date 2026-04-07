@@ -1223,8 +1223,8 @@ async function spawnNativeTuiInPlace(agentName, port, threadId, sessionFilePath 
   // Run TUI in the same pane as bridge (stdio: "inherit" → shared terminal)
   // bridge only handles IPC in the background while TUI takes over the screen
   const args = threadId
-    ? ["resume", threadId, "--remote", `ws://127.0.0.1:${port}`, "--enable", "tui_app_server"]
-    : ["--remote", `ws://127.0.0.1:${port}`, "--enable", "tui_app_server"];
+    ? ["resume", threadId, "--remote", `ws://127.0.0.1:${port}`]
+    : ["--remote", `ws://127.0.0.1:${port}`];
 
   const maxRetries = 2;
   for (let retry = 0; retry <= maxRetries; retry++) {
@@ -1740,8 +1740,8 @@ async function markMyTasksCompleted(config) {
 }
 
 // ─── Codex App Server Session ───
-// GPT 5.4 high fixed — do not use xhigh
-const codexEffort = "high";
+// GPT 5.4 xhigh fixed
+const codexEffort = "xhigh";
 
 function truncateOutput(output) {
   if (MAX_RESULT_BYTES > 0 && output.length > MAX_RESULT_BYTES) {
